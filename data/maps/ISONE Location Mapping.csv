@@ -1,0 +1,19 @@
+ISO-NE Name,Location,FLP Asset Name,Reporting Group,Operation Type
+NORTHFIELD MOUNTAIN PUMP 1,AR.NORTHFLD13.8NFD1P,Northfield Mountain,Northfield,Pumping
+NORTHFIELD MOUNTAIN PUMP 2,AR.NORTHFLD13.8NFD2P,Northfield Mountain,Northfield,Pumping
+NORTHFIELD MOUNTAIN PUMP 3,AR.NORTHFLD13.8NFD3P,Northfield Mountain,Northfield,Pumping
+NORTHFIELD MOUNTAIN PUMP 4,AR.NORTHFLD13.8NFD4P,Northfield Mountain,Northfield,Pumping
+ROCKY RIVER PUMP 1-2,AR.ROCKY_RV13.8ROCKP,Rocky River,CT - Hou,Pumping
+BULLS BRIDGE,UN.BULLSBDG27.6BULL,Bulls Bridge,CT - Hou,Generation
+FALLS VILLAGE,UN.FALSVL  69  FALS,Falls Village,CT - Hou,Generation
+CABOT,UN.MONTAGUE13.8CABT,Cabot,Cabot / TF,Generation
+TURNERSFALLS,UN.MONTAGUE13.8TURN,Turners Falls,Cabot / TF,Generation
+NORTHFIELD MOUNTAIN 1,UN.NORTHFLD13.8NFD1,Northfield Mountain,Northfield,Generation
+NORTHFIELD MOUNTAIN 2,UN.NORTHFLD13.8NFD2,Northfield Mountain,Northfield,Generation
+NORTHFIELD MOUNTAIN 3,UN.NORTHFLD13.8NFD3,Northfield Mountain,Northfield,Generation
+NORTHFIELD MOUNTAIN 4,UN.NORTHFLD13.8NFD4,Northfield Mountain,Northfield,Generation
+ROCKY RIVER,UN.ROCKY_RV13.8ROCK,Rocky River,CT - Hou,Generation
+SHEPAUG,UN.SHEPAUG 69  SHEP,Shepaug,CT - Hou,Generation
+STEVENSON,UN.STEVENSN6.9 STEV,Stevenson,CT - Hou,Generation
+TUNNEL 10,UN.TUNNEL  23.0TUNN,Tunnel Hydro,CT - East,Generation
+NORTHFIELD SOLAR,LD.FRENCHKG13.8,Northfield Solar,Northfield,Generation

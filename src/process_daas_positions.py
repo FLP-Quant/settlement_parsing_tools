@@ -2,6 +2,9 @@ import pandas as pd
 import numpy as np
 import os
 
+# Get Excel file from MIS "SD DAASCLEARED" files downloaded from here & merged into single CSV, then save as XLSX:
+#      https://ams.pharos-ei.com/org/ho-fl/isone/ftp_downloads
+
 # Read the Excel file, skipping first 4 rows
 folder = r'C:\Users\cbrooks\OneDrive - FIRSTLIGHTPOWER.COM\Documents\Python\settlement_parsing_tools'
 df = pd.read_excel(os.path.join(folder, '20250701_DAAS_Positions_raw_export.xlsx'), skiprows=4)
