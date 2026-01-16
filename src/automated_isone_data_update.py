@@ -24,6 +24,20 @@ if database_helpers not in sys.path:
 from flp_database_connector import flp_database_connector
 
 def automated_isone_data_update(username, token, table_name, tz, mis_report, start_date=None, fill_with_zeros=False):
+    
+    def safe_round_datetime(series):
+        """
+        Safely round datetime series to second precision, handling ambiguous times.
+        Converts to UTC first to avoid DST ambiguity, then converts back.
+        """
+        # Convert to UTC (no DST) to normalize, then convert back
+        # This avoids ambiguous time errors during DST transitions
+        result = series.dt.tz_convert('UTC')
+        # Normalize microseconds to 0 in UTC (no ambiguity)
+        result = result.dt.floor('S')
+        # Convert back to original timezone
+        result = result.dt.tz_convert(tz)
+        return result
 
     keys = ['name', 'ops_type', 'service']
     supported_tables = ['ops.isone_hourly_ancillary', 'ops.isone_hourly_energy']
@@ -64,7 +78,8 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
     start_date_str = start_date.strftime('%Y-%m-%d')
     
     # Check if table exists before querying
-    if not db_conn.table_exists(table_name, server="DataQuant01"):
+    table_exists = db_conn.table_exists(table_name, server="DataQuant01")
+    if not table_exists:
         print(f"Table {table_name} does not exist in database. Treating as empty table.")
         # Create DataFrame with correct columns but 0 rows to prevent KeyError later
         # Columns needed: composite_cols + volume columns
@@ -88,7 +103,8 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         ).dt.tz_convert(tz)
         # Normalize to second precision to handle microsecond differences between databases
         # Round to nearest second to match both 3:59:59.0 and 3:59:59.999... formats
-        existing_data['datetime_he'] = existing_data['datetime_he'].dt.round('S')
+        # Use safe rounding to handle ambiguous times during DST transitions
+        existing_data['datetime_he'] = safe_round_datetime(existing_data['datetime_he'])
     
     # Build unique_combos (same logic for both existing and new tables)
     if table_name == 'ops.isone_hourly_ancillary':
@@ -179,7 +195,8 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
     expected_df = pd.DataFrame(expected_records)
     # Normalize to second precision to handle microsecond differences between databases
     # Round to nearest second to match both 3:59:59.0 and 3:59:59.999... formats
-    expected_df['datetime_he'] = expected_df['datetime_he'].dt.round('S')
+    # Handle ambiguous times (fall back DST transition) using safe rounding
+    expected_df['datetime_he'] = safe_round_datetime(expected_df['datetime_he'])
     expected_df = expected_df.sort_values(by=composite_cols)
     # print(f"Expected data:\n{expected_df.head()}")
     
@@ -197,10 +214,45 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         # Merge existing data with expected data, including the volume column
         # If existing_data is empty, existing_subset will be empty and merge will result in all NaN
         if len(existing_data) > 0:
+            # Check if volume_col exists in existing_data
+            if volume_col not in existing_data.columns:
+                raise ValueError(
+                    f"Column '{volume_col}' not found in existing_data. "
+                    f"Available columns: {list(existing_data.columns)}"
+                )
             existing_subset = existing_data[composite_cols + [volume_col]].copy()
             existing_subset = existing_subset.sort_values(by=composite_cols)
+            
+            # Ensure datetime_he is in the same timezone and format as expected_df
+            if 'datetime_he' in existing_subset.columns:
+                existing_subset['datetime_he'] = pd.to_datetime(existing_subset['datetime_he']).dt.tz_convert(tz)
+                existing_subset['datetime_he'] = safe_round_datetime(existing_subset['datetime_he'])
         else:
             existing_subset = pd.DataFrame(columns=composite_cols + [volume_col])
+        
+        # Debug: Check merge alignment before merging
+        # Only check if table exists (skip if table doesn't exist - expected to have no matches)
+        if len(existing_subset) > 0 and len(expected_df) > 0 and table_exists:
+            # Sample a few records to check if merge keys align
+            sample_existing = existing_subset[composite_cols].head(5)
+            sample_expected = expected_df[composite_cols].head(5)
+            
+            # Try to find matches
+            test_merge = sample_expected.merge(
+                sample_existing,
+                on=composite_cols,
+                how='left',
+                indicator=True
+            )
+            match_count = (test_merge['_merge'] == 'both').sum()
+            if match_count == 0 and len(sample_existing) > 0:
+                warnings.warn(
+                    f"WARNING: Merge test found 0 matches out of {len(sample_expected)} expected records. "
+                    f"This suggests a mismatch in composite columns. "
+                    f"Sample existing datetime_he: {sample_existing['datetime_he'].head(3).tolist()}, "
+                    f"Sample expected datetime_he: {sample_expected['datetime_he'].head(3).tolist()}",
+                    UserWarning
+                )
         
         merged = expected_df.merge(
             existing_subset,
@@ -226,15 +278,62 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         missing_df = merged[merged['is_missing']].copy()
         missing_df = missing_df[composite_cols].copy()  # Keep only composite columns
         missing_df = missing_df.sort_values(by=composite_cols)
+        
+        # Safety check: If more than 90% of expected records are flagged as missing,
+        # this likely indicates a merge problem rather than actual missing data
+        # Exception: Skip this check if the table doesn't exist (expected to have 100% missing)
+        if len(expected_df) > 0 and table_exists:
+            missing_pct = len(missing_df) / len(expected_df) * 100
+            if missing_pct > 90:
+                raise ValueError(
+                    f"ERROR: {missing_pct:.1f}% of expected records ({len(missing_df)}/{len(expected_df)}) "
+                    f"were flagged as missing. This suggests a merge problem (e.g., timezone mismatch, "
+                    f"column name mismatch, or data type mismatch) rather than actual missing data. "
+                    f"Aborting to prevent overwriting existing data with incorrect values. "
+                    f"Please check:\n"
+                    f"  1. Timezone alignment between expected_df and existing_data\n"
+                    f"  2. Column names match exactly\n"
+                    f"  3. Data types are compatible\n"
+                    f"  4. Sample existing records: {existing_subset.head(3) if len(existing_subset) > 0 else 'N/A'}\n"
+                    f"  5. Sample expected records: {expected_df.head(3)}"
+                )
     else:
         # For other tables, use the original logic
         # If existing_data is empty, existing_subset will be empty and merge will result in all NaN
         if len(existing_data) > 0:
             existing_subset = existing_data[composite_cols].copy()
+            # Ensure datetime_he is in the same timezone and format as expected_df
+            if 'datetime_he' in existing_subset.columns:
+                existing_subset['datetime_he'] = pd.to_datetime(existing_subset['datetime_he']).dt.tz_convert(tz)
+                existing_subset['datetime_he'] = safe_round_datetime(existing_subset['datetime_he'])
             existing_subset['exists'] = True
             existing_subset = existing_subset.sort_values(by=composite_cols)
         else:
             existing_subset = pd.DataFrame(columns=composite_cols + ['exists'])
+        
+        # Debug: Check merge alignment before merging
+        # Only check if table exists (skip if table doesn't exist - expected to have no matches)
+        if len(existing_subset) > 0 and len(expected_df) > 0 and table_exists:
+            # Sample a few records to check if merge keys align
+            sample_existing = existing_subset[composite_cols].head(5)
+            sample_expected = expected_df[composite_cols].head(5)
+            
+            # Try to find matches
+            test_merge = sample_expected.merge(
+                sample_existing,
+                on=composite_cols,
+                how='left',
+                indicator=True
+            )
+            match_count = (test_merge['_merge'] == 'both').sum()
+            if match_count == 0 and len(sample_existing) > 0:
+                warnings.warn(
+                    f"WARNING: Merge test found 0 matches out of {len(sample_expected)} expected records. "
+                    f"This suggests a mismatch in composite columns. "
+                    f"Sample existing datetime_he: {sample_existing['datetime_he'].head(3).tolist()}, "
+                    f"Sample expected datetime_he: {sample_expected['datetime_he'].head(3).tolist()}",
+                    UserWarning
+                )
         
         merged = expected_df.merge(
             existing_subset,
@@ -246,6 +345,25 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         missing_df = merged[merged['exists'].isna()].copy()
         missing_df = missing_df[composite_cols].copy()
         missing_df = missing_df.sort_values(by=composite_cols)
+        
+        # Safety check: If more than 90% of expected records are flagged as missing,
+        # this likely indicates a merge problem rather than actual missing data
+        # Exception: Skip this check if the table doesn't exist (expected to have 100% missing)
+        if len(expected_df) > 0 and table_exists:
+            missing_pct = len(missing_df) / len(expected_df) * 100
+            if missing_pct > 90:
+                raise ValueError(
+                    f"ERROR: {missing_pct:.1f}% of expected records ({len(missing_df)}/{len(expected_df)}) "
+                    f"were flagged as missing. This suggests a merge problem (e.g., timezone mismatch, "
+                    f"column name mismatch, or data type mismatch) rather than actual missing data. "
+                    f"Aborting to prevent overwriting existing data with incorrect values. "
+                    f"Please check:\n"
+                    f"  1. Timezone alignment between expected_df and existing_data\n"
+                    f"  2. Column names match exactly\n"
+                    f"  3. Data types are compatible\n"
+                    f"  4. Sample existing records: {existing_subset.head(3) if len(existing_subset) > 0 else 'N/A'}\n"
+                    f"  5. Sample expected records: {expected_df.head(3)}"
+                )
         
         # Debug: Check for spring forward date (3/9/25) issues
         spring_forward_date = date(2025, 3, 9)
@@ -443,7 +561,8 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
             if 'datetime_he' in df_final.columns:
                 df_final['datetime_he'] = pd.to_datetime(df_final['datetime_he']).dt.tz_convert(tz)
                 # Normalize to second precision to handle microsecond differences between databases
-                df_final['datetime_he'] = df_final['datetime_he'].dt.round('S')
+                # Use safe rounding to handle ambiguous times during DST transitions
+                df_final['datetime_he'] = safe_round_datetime(df_final['datetime_he'])
             
             # Create a subset of df_final with composite columns for merging
             df_final_subset_for_dedup = df_final[composite_cols].copy()
@@ -642,7 +761,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                                     if table_name == 'ops.isone_hourly_ancillary':
                                         if mis_report == 'SD_DAASCLEARED':
                                             still_missing_to_fill['da_volume'] = 0
-                                            still_missing_to_fill['rt_volume'] = ""
+                                            still_missing_to_fill['rt_volume'] = pd.NA  # Use pd.NA instead of "" for numeric column
                                             still_missing_to_fill['unit'] = "MW"
                                             still_missing_to_fill['interval_width_s'] = 3600
                                             mapping = retrieve_isone_location_map(mapping_path)
@@ -652,7 +771,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                                             mapping = mapping.drop_duplicates(subset=['name'], keep='first')
                                             still_missing_to_fill = still_missing_to_fill.merge(mapping, how="left", on="name")
                                         elif mis_report == 'OI_UNITRTRSV':
-                                            still_missing_to_fill['da_volume'] = ""
+                                            still_missing_to_fill['da_volume'] = pd.NA  # Use pd.NA instead of "" for numeric column
                                             still_missing_to_fill['rt_volume'] = 0
                                             still_missing_to_fill['unit'] = "MW"
                                             still_missing_to_fill['interval_width_s'] = 3600
@@ -784,6 +903,22 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                     )
                 else:
                     print(f"No duplicates found in final data (count: {len(df_final)})")
+
+                # Ensure da_volume and rt_volume are numeric before upload
+                # Convert empty strings and other non-numeric values to NaN, then coerce to numeric type
+                print("Converting volume columns to numeric types...")
+                if 'da_volume' in df_final.columns:
+                    # Replace empty strings and None with NaN, then convert to numeric
+                    df_final['da_volume'] = df_final['da_volume'].replace(['', None], pd.NA)
+                    df_final['da_volume'] = pd.to_numeric(df_final['da_volume'], errors='coerce')
+                    # Ensure the dtype is numeric (float64 to handle NaN values)
+                    df_final['da_volume'] = df_final['da_volume'].astype('float64')
+                if 'rt_volume' in df_final.columns:
+                    # Replace empty strings and None with NaN, then convert to numeric
+                    df_final['rt_volume'] = df_final['rt_volume'].replace(['', None], pd.NA)
+                    df_final['rt_volume'] = pd.to_numeric(df_final['rt_volume'], errors='coerce')
+                    # Ensure the dtype is numeric (float64 to handle NaN values)
+                    df_final['rt_volume'] = df_final['rt_volume'].astype('float64')
 
                 # Upload to database
                 print("Uploading to database...")
