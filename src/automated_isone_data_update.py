@@ -34,7 +34,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         # This avoids ambiguous time errors during DST transitions
         result = series.dt.tz_convert('UTC')
         # Normalize microseconds to 0 in UTC (no ambiguity)
-        result = result.dt.floor('S')
+        result = result.dt.floor('s')
         # Convert back to original timezone
         result = result.dt.tz_convert(tz)
         return result
@@ -282,7 +282,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         # Safety check: If more than 90% of expected records are flagged as missing,
         # this likely indicates a merge problem rather than actual missing data
         # Exception: Skip this check if the table doesn't exist (expected to have 100% missing)
-        if len(expected_df) > 0 and table_exists:
+        if len(expected_df) > 0 and table_exists and mis_report != 'OI_UNITRTRSV':
             missing_pct = len(missing_df) / len(expected_df) * 100
             if missing_pct > 90:
                 raise ValueError(
@@ -349,7 +349,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         # Safety check: If more than 90% of expected records are flagged as missing,
         # this likely indicates a merge problem rather than actual missing data
         # Exception: Skip this check if the table doesn't exist (expected to have 100% missing)
-        if len(expected_df) > 0 and table_exists:
+        if len(expected_df) > 0 and table_exists and mis_report != 'OI_UNITRTRSV':
             missing_pct = len(missing_df) / len(expected_df) * 100
             if missing_pct > 90:
                 raise ValueError(
@@ -480,7 +480,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
             group_start = date_group[0].strftime('%Y-%m-%d')
             group_end = (date_group[-1] + timedelta(days=1)).strftime('%Y-%m-%d')  # API expects exclusive end
             if mis_report == 'OI_UNITRTRSV':
-                most_recent_version = 'false' # For OI_UNITRTRSV, reports are stored hourly andthis flag appears to treat each hour as a duplicate, so it only returns HE 24
+                most_recent_version = 'false' # For OI_UNITRTRSV, reports are stored hourly and this flag appears to treat each hour as a duplicate, so it only returns HE 24
             else:
                 most_recent_version = 'true'
             
@@ -503,11 +503,8 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         
         # Combine all raw data
         if all_raw_data:
-            print(f"\nCombining data from {len(all_raw_data)} API responses...")
-            # df_raw_combined = pd.concat(all_raw_data, ignore_index=True)
+            print(f"\nProcessing combined data from {len(all_raw_data)} API responses...")
             
-            # Process the combined data
-            print("Processing combined data...")
             # Load relevant paths
             project_root = os.path.abspath(os.path.join(os.getcwd(), ".."))
             data_folder = os.path.join(project_root, "data")

@@ -4,6 +4,7 @@ import os
 import sys
 import warnings
 from datetime import timedelta
+from IPython.display import display, HTML
 
 # Add the src directory to the Python path so we can import the parsers module
 project_root = os.path.abspath(os.path.join(os.getcwd(), ".."))
@@ -50,11 +51,6 @@ def process_daas_cleared_data(dfs, mapping_path):
         expected_col_count = len(expected_columns)
         
         if actual_col_count != expected_col_count:
-            # Print debugging information
-            print(f"WARNING: DataFrame {i+1} has {actual_col_count} columns, expected {expected_col_count}")
-            print(f"First few actual column names: {list(df.columns[:10])}")
-            if actual_col_count > 0:
-                print(f"First row sample: {df.iloc[0].head(10).to_dict()}")
             
             # If we have more columns than expected, use only the first N columns
             if actual_col_count > expected_col_count:
@@ -328,26 +324,72 @@ def process_rt_reserve_data(dfs, mapping_path):
     
     dfs_clean = []
     # Loop through first to ensure that column names match so that concat works
-    for df in dfs:
+   # Loop through first to ensure that column names match so that concat works
+    for i, df in enumerate(dfs):
+        # # Get the headers from first row
+        # headers = df.iloc[0]
+        
         # Drop the first two rows (headers and units) from the main dataframe
         df = df.iloc[2:].reset_index(drop=True)
         
-        # Validate column structure - throw error if it doesn't match
-        if len(df.columns) != len(expected_columns):
-            raise ValueError(
-                f"Expected {len(expected_columns)} columns but found {len(df.columns)}. "
-                f"Expected columns: {expected_columns}"
-            )
+        # Check column count and provide helpful error message
+        actual_col_count = len(df.columns)
+        expected_col_count = len(expected_columns)
         
-        # Rename columns to match the expected structure
+        if actual_col_count != expected_col_count:
+            
+            # If we have more columns than expected, use only the first N columns
+            if actual_col_count > expected_col_count:
+                print(f"Using only the first {expected_col_count} columns and ignoring the rest.")
+                df = df.iloc[:, :expected_col_count]
+            else:
+                raise ValueError(
+                    f"DataFrame {i+1} has {actual_col_count} columns but expected {expected_col_count}. "
+                    f"This suggests the API response format has changed. "
+                    f"Actual columns: {list(df.columns)}"
+                )
+        
+        # Rename columns to match the structure
         df.columns = expected_columns
         dfs_clean.append(df)
     
     # Combine the dfs
     df = pd.concat(dfs_clean, ignore_index=True)
     
-    # Filter for code 'D' in the Data vs. Header Code column
     df = df[df['Data_vs_Header_Code'] == 'D']
+    
+    # Parse and keep the CSV's Date column for groupby. The API may return Timestamp as time-only
+    # (e.g. "01:00", "01:05"); deriving date from Timestamp would then give the same date for all
+    # rows and collapse the groupby to one day. Use the report Date from the CSV instead.
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+
+    # Handle DST before parsing - check if Timestamp contains "X" (similar to DA function's "02X")
+    # Create DST flag before parsing timestamps - True means it's the second 2AM (EST, after fall back)
+    df['is_dst_fallback'] = df['Timestamp'].astype(str).str.contains('X', na=False)
+    
+    # Remove "X" from Timestamp strings before parsing (similar to replacing "02X" with "02" in DA function)
+    df['Timestamp'] = df['Timestamp'].astype(str).str.replace('X', '', regex=False)
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    
+    # Convert designation columns to numeric
+    designation_cols = ['TMSR_Designation', 'TMNSR_Designation', 'TMOR_Designation']
+    for col in designation_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Convert 5-minute intervals to hourly intervals by averaging
+    # Compute hour-ending from timestamp (similar to DA function's Hour_Ending)
+    # Hour-ending is the hour that the interval ends in (1-24, where 24 = midnight)
+    # For a timestamp at hour H, the hour-ending is H+1
+    df['Hour_Ending'] = df['Timestamp'].dt.hour + 1
+
+    # Group by Asset_ID, Date, Hour_Ending to aggregate 5-minute intervals to hourly
+    # Also preserve is_dst_fallback (take any True value, or False if all False)
+    groupby_cols = ['Asset_ID', 'Date', 'Hour_Ending']
+    agg_dict = {col: 'mean' for col in designation_cols}
+    agg_dict['is_dst_fallback'] = lambda x: x.any()  # True if any interval in the hour is fallback
+    agg_dict['Version'] = 'first'
+    
+    df_hourly = df.groupby(groupby_cols, as_index=False).agg(agg_dict)
     
     # Filter out duplicates, keeping latest version (same logic as DAAS)
     def filter_duplicate_reports(df):
@@ -357,9 +399,8 @@ def process_rt_reserve_data(dfs, mapping_path):
         df['Version'] = pd.to_datetime(df['Version'], errors='coerce')
         df_sorted = df.sort_values(by='Version', ascending=False, na_position='last')
         
-        # Identify duplicates based on Asset_ID, Timestamp, and service columns
-        # Note: We'll handle service columns after melting, so for now use Asset_ID and Timestamp
-        dup_cols = ['Asset_ID', 'Timestamp']
+        # Identify duplicates based on Asset_ID, Date, and Hour_Ending
+        dup_cols = ['Date', 'Hour_Ending', 'Asset_ID']
         duplicates_mask = df_sorted.duplicated(subset=dup_cols, keep=False)
         
         # Find rows that are true duplicates in key columns *and* have same Version
@@ -387,38 +428,7 @@ def process_rt_reserve_data(dfs, mapping_path):
             print(f"{deleted_rows} duplicate rows removed based on most recent Version.")
         return df_deduped
     
-    df = filter_duplicate_reports(df)
-    
-    # Handle DST before parsing - check if Timestamp contains "X" (similar to DA function's "02X")
-    # Create DST flag before parsing timestamps - True means it's the second 2AM (EST, after fall back)
-    df['is_dst_fallback'] = df['Timestamp'].astype(str).str.contains('X', na=False)
-    
-    # Remove "X" from Timestamp strings before parsing (similar to replacing "02X" with "02" in DA function)
-    df['Timestamp'] = df['Timestamp'].astype(str).str.replace('X', '', regex=False)
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    
-    # Convert designation columns to numeric
-    designation_cols = ['TMSR_Designation', 'TMNSR_Designation', 'TMOR_Designation']
-    for col in designation_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Convert 5-minute intervals to hourly intervals by averaging
-    # Compute hour-ending from timestamp (similar to DA function's Hour_Ending)
-    # Hour-ending is the hour that the interval ends in (1-24, where 24 = midnight)
-    # For a timestamp at hour H, the hour-ending is H+1
-    df['Hour_Ending'] = df['Timestamp'].dt.hour + 1
-    
-    # Get Date from Timestamp
-    df['Date'] = df['Timestamp'].dt.date
-    
-    # Group by Asset_ID, Date, Hour_Ending to aggregate 5-minute intervals to hourly
-    # Also preserve is_dst_fallback (take any True value, or False if all False)
-    groupby_cols = ['Asset_ID', 'Date', 'Hour_Ending']
-    agg_dict = {col: 'mean' for col in designation_cols}
-    agg_dict['is_dst_fallback'] = lambda x: x.any()  # True if any interval in the hour is fallback
-    agg_dict['Version'] = 'first'
-    
-    df_hourly = df.groupby(groupby_cols, as_index=False).agg(agg_dict)
+    df_hourly = filter_duplicate_reports(df_hourly)
 
     ## Create datetime column, localize, and handle timezone localization with DST disambiguation
     # Convert hour-ending integer to time delta
@@ -447,8 +457,22 @@ def process_rt_reserve_data(dfs, mapping_path):
         raise ValueError("'PNode ID' column not found in mapping file. Cannot map Asset IDs to asset names.")
     
     mapping_subset = mapping[["PNode ID", "ISO-NE Name", "FLP Asset Name", "Operation Type"]].copy()
+    mapping_subset = mapping_subset.drop_duplicates(subset=['PNode ID'], keep='last')
     
-    # Convert Asset_ID to string for matching (in case one is numeric and one is string)
+    # # Convert Asset_ID to string for matching (in case one is numeric and one is string)
+    # rows_before_merge = len(df_hourly)
+    # print(f"[DEBUG process_rt_reserve_data] Before merge with mapping: {rows_before_merge} rows")
+    
+    # # Check unique Asset_IDs before merge
+    # unique_asset_ids = df_hourly['Asset_ID'].nunique()
+    # print(f"[DEBUG process_rt_reserve_data] Unique Asset_IDs in data: {unique_asset_ids}")
+    # print(f"[DEBUG process_rt_reserve_data] Sample Asset_IDs: {df_hourly['Asset_ID'].unique()[:10].tolist()}")
+    
+    # # Check unique PNode IDs in mapping
+    # unique_pnode_ids = mapping_subset['PNode ID'].nunique()
+    # print(f"[DEBUG process_rt_reserve_data] Unique PNode IDs in mapping: {unique_pnode_ids}")
+    # print(f"[DEBUG process_rt_reserve_data] Sample PNode IDs: {mapping_subset['PNode ID'].unique()[:10].tolist()}")
+    
     df_hourly['Asset_ID'] = df_hourly['Asset_ID'].astype(str)
     mapping_subset['PNode ID'] = mapping_subset['PNode ID'].astype(str)
     
@@ -470,9 +494,20 @@ def process_rt_reserve_data(dfs, mapping_path):
         inplace=True
     )
     
+    # # Check how many rows have missing mapping (NaN in asset/name/ops_type)
+    # missing_mapping = df_hourly['asset'].isna().sum()
+    # if missing_mapping > 0:
+    #     print(f"[DEBUG process_rt_reserve_data] WARNING: {missing_mapping} rows have missing mapping (Asset_ID not found in mapping file)")
+    #     print(f"[DEBUG process_rt_reserve_data] Unmapped Asset_IDs: {df_hourly[df_hourly['asset'].isna()]['Asset_ID'].unique()[:20].tolist()}")
+    # else:
+    #     print(f"[DEBUG process_rt_reserve_data] All rows successfully mapped")
+
     # Keep only the specified columns (similar to DA function)
     columns_to_keep = ['datetime_he', 'asset', 'name', 'ops_type'] + designation_cols
     df_hourly = df_hourly[columns_to_keep]
+    
+    # Filter out rows with missing asset/name/ops_type (from failed mapping)
+    df_hourly = df_hourly.dropna(subset=['asset', 'name', 'ops_type'])
     
     # Sort by Date, Hour_Ending, asset (similar to DA function)
     df_hourly.sort_values(by=["datetime_he", "asset"], inplace=True)
