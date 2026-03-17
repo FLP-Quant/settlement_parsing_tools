@@ -1,10 +1,13 @@
 import base64
-import requests
-import os
 import io
+import os
+from urllib.parse import urlencode
+import requests
 import pandas as pd
 from typing import Optional
 from IPython.display import display, HTML
+
+from src.parsers import retrieve_isone_location_map
 
 
 def base64_encode(text: str) -> str:
@@ -215,8 +218,8 @@ def query_ams_with_basic_auth(
                 return pd.json_normalize(j, **json_read_kwargs)
             elif isinstance(j, dict):
                 # if dict contains a top-level array with a likely data key, attempt to find it
-                # common patterns: {'data': [...]} or {'rows': [...]}
-                for candidate in ("data", "results", "rows", "items"):
+                # common patterns: {'data': [...]}, {'rows': [...]}, {'schedules': [...]}, etc.
+                for candidate in ("data", "results", "rows", "items", "schedules"):
                     if candidate in j and isinstance(j[candidate], list):
                         return pd.json_normalize(j[candidate], **json_read_kwargs)
                 # otherwise normalize the whole dict; json_normalize will produce a single-row frame
@@ -254,5 +257,145 @@ def query_ams_with_basic_auth(
             f"First 1000 chars: {snippet!r}"
         )
         raise ValueError(error_msg)
+
+    return df
+
+
+# Default base URL for Pharos AMS API (can be overridden for testing)
+DEFAULT_PHAROS_BASE_URL = "https://ams.pharos-ei.com"
+
+
+def query_schedule_offers_historic(
+    api_token: str,
+    organization_key: str,
+    start_date: str,
+    market: str,
+    *,
+    end_date: Optional[str] = None,
+    base_url: str = DEFAULT_PHAROS_BASE_URL,
+    timeout: int = 30,
+    save_to_file: Optional[str] = None,
+    csv_read_kwargs: Optional[dict] = None,
+) -> pd.DataFrame:
+    """
+    Query the ISONE schedule offer price data (historic) API.
+
+    GET /api/isone/schedule_offers/historic
+    Returns the schedule offer price data as CSV.
+
+    Parameters
+    ----------
+    api_token : str
+        Either "username:password" or a pre-encoded Base64 token (see query_ams_with_basic_auth).
+    organization_key : str
+        Key to limit the query to only the firms in an organization or a specific firm.
+    start_date : str
+        Start date in YYYY-MM-DD format, or relative word: 'yesterday', 'today', 'tomorrow'.
+        No more than 365 days may be requested.
+    market : str
+        One of: 'day_ahead', 'reoffer', 'real_time'.
+    end_date : str, optional
+        End date in YYYY-MM-DD format, or relative word. If empty, defaults to start_date.
+        No more than 365 days may be requested.
+    base_url : str, optional
+        API base URL. Defaults to https://ams.pharos-ei.com.
+    timeout : int, optional
+        Request timeout in seconds. Default 30.
+    save_to_file : str, optional
+        If provided, the raw CSV response is saved to this path.
+    csv_read_kwargs : dict, optional
+        Extra kwargs passed to pd.read_csv when parsing the response.
+
+    Returns
+    -------
+    pd.DataFrame
+        Schedule offer price data.
+
+    Raises
+    ------
+    ValueError
+        If market is not one of day_ahead, reoffer, real_time.
+    """
+    market = market.strip().lower()
+    allowed = ("day_ahead", "reoffer", "real_time")
+    if market not in allowed:
+        raise ValueError(f"market must be one of {allowed!r}, got {market!r}")
+
+    path = "/api/isone/schedule_offers/historic"
+    params = {
+        "organization_key": organization_key,
+        "start_date": start_date.strip(),
+        "market": market,
+    }
+    if end_date is not None and end_date.strip():
+        params["end_date"] = end_date.strip()
+
+    url = f"{base_url.rstrip('/')}{path}?{urlencode(params)}"
+
+    return query_ams_with_basic_auth(
+        url,
+        api_token,
+        timeout=timeout,
+        save_to_file=save_to_file,
+        csv_read_kwargs=csv_read_kwargs or {},
+    )
+
+
+def process_schedule_offers_historic(
+    df: pd.DataFrame,
+    mapping_path: str,
+    *,
+    tz: str = "America/New_York",
+) -> pd.DataFrame:
+    """
+    Post-process raw schedule offers historic DataFrame to match project conventions.
+
+    - Drops all columns to the right of price_9 (keeps 28 columns).
+    - Keeps only sched_type_id == 12 (price-based; 95-99 are cost-based per ISO-NE).
+    - Drops rows where hour_ending == "Default".
+    - Maps unit_id/unit_name/iso_id to name and asset via ISONE Location Mapping.
+    - Converts timestamp to datetime_he with timezone.
+    - Adds service="energy", ops_type="generation"; renames market -> market_type.
+    """
+    if df.empty:
+        return df.copy()
+
+    # Drop all columns to the right of "price_9" (keeps 28 columns)
+    if "price_9" not in df.columns:
+        raise ValueError("Expected column 'price_9' in schedule offers data")
+    idx = df.columns.get_loc("price_9")
+    df = df.iloc[:, : idx + 1].copy()
+
+    # Per ISO-NE eMarket Users Guide: 0-94 are price-based schedules, 95-99 are
+    # cost-based schedules reserved for use by ISO New England. Keep only 12.
+    df = df[df["sched_type_id"] == 12].copy()
+
+    # Filter out placeholder rows
+    df = df[df["hour_ending"] != "Default"].copy()
+
+    # Map unit_name -> name and asset using same ISONE Location Mapping as other tables
+    mapping = retrieve_isone_location_map(mapping_path)
+    mapping = mapping[["ISO-NE Name", "FLP Asset Name"]].drop_duplicates(
+        subset=["ISO-NE Name"], keep="first"
+    )
+    df = df.merge(
+        mapping,
+        left_on="unit_name",
+        right_on="ISO-NE Name",
+        how="left",
+    )
+    df = df.rename(columns={"FLP Asset Name": "asset", "ISO-NE Name": "name"})
+    df = df.drop(columns=["unit_id", "unit_name", "iso_id", "sched_type_id"], errors="ignore")
+
+    # timestamp is hour-ending time; align with project convention as datetime_hb
+    df["datetime_hb"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(tz)
+    df = df.drop(columns=["timestamp"], errors="ignore")
+
+    # Add columns consistent with other tables
+    df["service"] = "energy"
+    df["ops_type"] = "generation"
+
+    # Rename market for clarity
+    df = df.rename(columns={"market": "market_type"})
 
     return df
