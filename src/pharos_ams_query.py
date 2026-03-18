@@ -364,31 +364,22 @@ def process_schedule_offers_historic(
     """
     Post-process raw schedule offers historic DataFrame to match project conventions.
 
-    - Drops all columns to the right of price_9 (keeps 28 columns).
     - Keeps only schedule_type_id == 12 (price-based; 95-99 are cost-based per ISO-NE).
       Generation uses sched_type_id; Pumping (ARD) uses ard_sched_type_id / ard_schedule_type_id.
     - Drops rows where hour_ending == "Default".
-    - Maps unit_id/unit_name/iso_id to name and asset via ISONE Location Mapping.
-    - Converts timestamp to datetime_he with timezone.
-    - Adds service="energy", ops_type="generation"; renames market -> market_type.
+    - Maps unit_id/unit_name/iso_id to name and asset via ISONE Location Mapping; drops those raw columns.
+    - Converts timestamp to datetime_hb with timezone.
+    - Adds service="energy"; ops_type is set upstream in query_schedule_offers_historic. Renames market -> market_type.
     """
     if df.empty:
         return df.copy()
 
-    # Preserve ops_type if query function added it; the column may appear to the right of price_9
-    # and would otherwise be dropped by the slice below.
-    ops_type_col = df["ops_type"].copy() if "ops_type" in df.columns else None
-
-    # Drop all columns to the right of "price_9" (keeps 28 columns)
     if "price_9" not in df.columns:
         raise ValueError("Expected column 'price_9' in schedule offers data")
-    idx = df.columns.get_loc("price_9")
-    df = df.iloc[:, : idx + 1].copy()
-    if ops_type_col is not None:
-        df["ops_type"] = ops_type_col
 
     # Per ISO-NE eMarket Users Guide: 0-94 are price-based schedules, 95-99 are
     # cost-based schedules reserved for use by ISO New England. Keep only 12.
+    # Do this before dropping columns to the right of price_9 (sched_type_id lives there).
     sched_col = None
     if "sched_type_id" in df.columns:
         sched_col = "sched_type_id"
@@ -403,7 +394,7 @@ def process_schedule_offers_historic(
         )
     df = df[df[sched_col] == 12].copy()
 
-    # Filter out placeholder rows
+    # Filter out placeholder rows (before dropping columns)
     df = df[df["hour_ending"] != "Default"].copy()
 
     # Map unit_name -> name and asset using same ISONE Location Mapping as other tables

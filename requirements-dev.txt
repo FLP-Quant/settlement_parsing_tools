@@ -1,0 +1,5 @@
+# Test and development dependencies for settlement_parsing_tools
+# Install with: pip install -r requirements-dev.txt
+
+pytest>=7.0.0
+pandas>=1.5.0
