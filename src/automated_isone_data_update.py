@@ -13,7 +13,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.process_as_positions import process_daas_cleared_data, process_rt_reserve_data
-from src.pharos_ams_query import query_ams_with_basic_auth
+from src.pharos_ams_query import query_ams_with_basic_auth, query_schedule_offers_historic, process_schedule_offers_historic
 from src.parsers import RealTimeOps, prep_rtlocsum_for_quant_db, retrieve_isone_location_map
 
 # FLP database connection tools path
@@ -21,35 +21,62 @@ flp_db_tools_path = r"C:\Users\cbrooks\OneDrive - FIRSTLIGHTPOWER.COM\Documents\
 database_helpers = os.path.join(flp_db_tools_path,"Helpers")
 if database_helpers not in sys.path:
     sys.path.append(database_helpers)
-from flp_database_connector import flp_database_connector
+from flp_database_connector import (
+    flp_database_connector,
+    find_missing_timeseries_records,
+    filter_rows_for_upsert,
+)
+from src.isone_update_core import (
+    build_expected_grid,
+    debug_spring_forward_missing,
+    fill_missing_with_defaults,
+    group_contiguous_dates,
+    chunk_date_groups,
+    segment_into_monthly_chunks,
+    safe_round_datetime,
+)
 
-def automated_isone_data_update(username, token, table_name, tz, mis_report, start_date=None, fill_with_zeros=False):
-    
-    def safe_round_datetime(series):
-        """
-        Safely round datetime series to second precision, handling ambiguous times.
-        Converts to UTC first to avoid DST ambiguity, then converts back.
-        """
-        # Convert to UTC (no DST) to normalize, then convert back
-        # This avoids ambiguous time errors during DST transitions
-        result = series.dt.tz_convert('UTC')
-        # Normalize microseconds to 0 in UTC (no ambiguity)
-        result = result.dt.floor('s')
-        # Convert back to original timezone
-        result = result.dt.tz_convert(tz)
-        return result
 
-    keys = ['name', 'ops_type', 'service']
-    supported_tables = ['ops.isone_hourly_ancillary', 'ops.isone_hourly_energy']
+def automated_isone_data_update(
+    username,
+    token,
+    table_name,
+    tz,
+    mis_report=None,
+    market=None,
+    offers_ops_type_mode: str = "both",
+    start_date=None,
+    fill_with_zeros=False,
+):
+    """
+    mis_report : used for ops.isone_hourly_ancillary (e.g. 'SD_DAASCLEARED', 'OI_UNITRTRSV').
+    market : used for offers.flp_isone_energy (e.g. 'day_ahead', 'reoffer', 'real_time'); default 'day_ahead'.
+    """
+    supported_tables = ['ops.isone_hourly_ancillary', 'ops.isone_hourly_energy', 'offers.flp_isone_energy']
     if table_name not in supported_tables:
         raise ValueError(f"Table name '{table_name}' not yet supported. supported values are: {supported_tables}")
-    
+
+    if table_name == 'offers.flp_isone_energy':
+        if market is None:
+            market = 'day_ahead'
+        if market not in ('day_ahead', 'reoffer', 'real_time'):
+            raise ValueError(f"market must be one of 'day_ahead', 'reoffer', 'real_time', got {market!r}")
+        if offers_ops_type_mode not in ("both", "Generation", "Pumping"):
+            raise ValueError(
+                f"offers_ops_type_mode must be one of 'both', 'Generation', 'Pumping', got {offers_ops_type_mode!r}"
+            )
+        keys = ['name', 'market_type', 'ops_type', 'service']
+    else:
+        if mis_report is None:
+            raise ValueError(f"mis_report is required for table {table_name}")
+        keys = ['name', 'ops_type', 'service']
+
     # Composite columns used for identifying unique records
     composite_cols = ['datetime_he'] + keys
-    
+
     # End date: end of day 2 days prior to today (common for both cases)
     end_date = (datetime.now().date() - timedelta(days=2))
-    
+
     # Determine start_date first (before querying) - either from input or default
     if start_date is None:
         # Use default date range based on table
@@ -57,6 +84,8 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
             start_date = datetime(2025,3,1).date()
         elif table_name == 'ops.isone_hourly_energy':
             start_date = datetime(2016,5,11).date()
+        elif table_name == 'offers.flp_isone_energy':
+            start_date = datetime(2025, 1, 1).date()
         print(f"Using default start_date: {start_date}")
     else:
         # User provided start_date, use it
@@ -81,9 +110,7 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
     table_exists = db_conn.table_exists(table_name, server="DataQuant01")
     if not table_exists:
         print(f"Table {table_name} does not exist in database. Treating as empty table.")
-        # Create DataFrame with correct columns but 0 rows to prevent KeyError later
-        # Columns needed: composite_cols + volume columns
-        existing_data = pd.DataFrame(columns=composite_cols + ['da_volume', 'rt_volume'])
+        existing_data = pd.DataFrame(columns=composite_cols + (['da_volume', 'rt_volume'] if table_name != 'offers.flp_isone_energy' else []))
     else:
         # Query with date filter to only get data >= start_date
         sql_query = f"""
@@ -93,19 +120,15 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         """
         existing_data = db_conn.read_from_db("DataQuant01", "", sql_query)
     
-    # Process existing_data datetime - datetime_he is stored in 'America/New_York'
-    # When pulled from database, it comes out as UTC + offset, so we need to handle timezone conversion
+    # Process existing_data datetime (all tables have datetime_he and datetime_hb)
     if len(existing_data) > 0:
-        # Parse datetime_he - it comes from DB as UTC+offset, but represents America/New_York time
-        existing_data['datetime_he'] = pd.to_datetime(
-            existing_data['datetime_he'], 
-            utc=True
-        ).dt.tz_convert(tz)
-        # Normalize to second precision to handle microsecond differences between databases
-        # Round to nearest second to match both 3:59:59.0 and 3:59:59.999... formats
-        # Use safe rounding to handle ambiguous times during DST transitions
-        existing_data['datetime_he'] = safe_round_datetime(existing_data['datetime_he'])
-    
+        if 'datetime_he' in existing_data.columns:
+            existing_data['datetime_he'] = pd.to_datetime(existing_data['datetime_he'], utc=True).dt.tz_convert(tz)
+            existing_data['datetime_he'] = safe_round_datetime(existing_data['datetime_he'], tz)
+        if 'datetime_hb' in existing_data.columns:
+            existing_data['datetime_hb'] = pd.to_datetime(existing_data['datetime_hb'], utc=True).dt.tz_convert(tz)
+            existing_data['datetime_hb'] = safe_round_datetime(existing_data['datetime_hb'], tz)
+
     # Build unique_combos (same logic for both existing and new tables)
     if table_name == 'ops.isone_hourly_ancillary':
         asset_names = ['NORTHFIELD MOUNTAIN 1', 'NORTHFIELD MOUNTAIN 2', 'NORTHFIELD MOUNTAIN 3', 'NORTHFIELD MOUNTAIN 4',
@@ -142,263 +165,48 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                 for asset in asset_names
             ]
         )
-    
-    # Create expected datetime range (hourly intervals) - same for both cases
-    # Make start and end timezone-aware to properly handle DST transitions
-    # Start at 1:00 AM on start_date (hour-ending 1)
-    start_dt = pd.Timestamp(start_date, tz=tz) + timedelta(hours=1)
-    # End at end of end_date (midnight of the next day, which is exclusive)
-    end_dt = pd.Timestamp(end_date + timedelta(days=1), tz=tz)
-    
-    expected_datetimes = pd.date_range(
-        start=start_dt,
-        end=end_dt,
-        freq='h',
-        inclusive='right'
+    elif table_name == 'offers.flp_isone_energy':
+        # One placeholder row so expected grid = one row per hour; API returns all units (ops_type/service fixed in process)
+        if offers_ops_type_mode == "both":
+            ops_types = ["Generation", "Pumping"]
+        else:
+            ops_types = [offers_ops_type_mode]
+        unique_combos = pd.DataFrame(
+            [
+                {"name": "*", "market_type": market, "ops_type": ot, "service": "energy"}
+                for ot in ops_types
+            ]
+        )
+
+    # Build expected (datetime_he, keys) grid; DST spring-forward handled in isone_update_core
+    expected_df = build_expected_grid(
+        start_date, end_date, tz, unique_combos, composite_cols
     )
-    
-    # Handle spring forward DST transition: convert hour-ending from XX:00:00 to XX:59:59
-    # On spring forward day, the hour from 2 AM to 3 AM doesn't exist, so the database
-    # stores the hour ending as 03:59:59 instead of 03:00:00
-    adjusted_datetimes = []
-    for i, dt in enumerate(expected_datetimes):
-        # Check if this is the first hour after a gap (spring forward)
-        if i > 0:
-            prev_dt = expected_datetimes[i-1]
-            
-            # Check if the hour jumps by more than 1 (indicating spring forward gap)
-            # For example: hour 1 -> hour 3 means hour 2 was skipped
-            prev_hour = prev_dt.hour
-            curr_hour = dt.hour
-            
-            # Also check if we're on the same date (spring forward happens within a day)
-            same_date = prev_dt.date() == dt.date()
-            
-            # If hour jumps by more than 1 on the same date, it's spring forward
-            if same_date and (curr_hour - prev_hour) > 1:
-                # This is the hour after spring forward - convert to XX:59:59 format
-                # Replace the time component: keep date and timezone, change time to XX:59:59
-                adjusted_dt = dt.replace(minute=59, second=59, microsecond=0)
-                adjusted_datetimes.append(adjusted_dt)
-                continue
-        adjusted_datetimes.append(dt)
-    
-    # Create complete expected dataset - same for both cases
-    expected_records = []
-    for _, combo in unique_combos.iterrows():
-        for dt in adjusted_datetimes:
-            record = {'datetime_he': dt}
-            for k in keys:
-                record[k] = combo[k]
-            expected_records.append(record)
-    
-    expected_df = pd.DataFrame(expected_records)
-    # Normalize to second precision to handle microsecond differences between databases
-    # Round to nearest second to match both 3:59:59.0 and 3:59:59.999... formats
-    # Handle ambiguous times (fall back DST transition) using safe rounding
-    expected_df['datetime_he'] = safe_round_datetime(expected_df['datetime_he'])
-    expected_df = expected_df.sort_values(by=composite_cols)
-    # print(f"Expected data:\n{expected_df.head()}")
-    
-    # Merge to find missing records - same logic for both cases
-    # For 'ops.isone_hourly_ancillary', also check if the relevant column is blank
+
+    # Identify missing records (gap detection via database helpers)
+    volume_col = None
     if table_name == 'ops.isone_hourly_ancillary':
-        # Determine which column to check based on mis_report
         if mis_report == 'SD_DAASCLEARED':
             volume_col = 'da_volume'
         elif mis_report == 'OI_UNITRTRSV':
             volume_col = 'rt_volume'
         else:
             raise ValueError(f"For table 'ops.isone_hourly_ancillary', expected MIS reports are 'SD_DAASCLEARED' or 'OI_UNITRTRSV' but instead was {mis_report}.")
-        
-        # Merge existing data with expected data, including the volume column
-        # If existing_data is empty, existing_subset will be empty and merge will result in all NaN
-        if len(existing_data) > 0:
-            # Check if volume_col exists in existing_data
-            if volume_col not in existing_data.columns:
-                raise ValueError(
-                    f"Column '{volume_col}' not found in existing_data. "
-                    f"Available columns: {list(existing_data.columns)}"
-                )
-            existing_subset = existing_data[composite_cols + [volume_col]].copy()
-            existing_subset = existing_subset.sort_values(by=composite_cols)
-            
-            # Ensure datetime_he is in the same timezone and format as expected_df
-            if 'datetime_he' in existing_subset.columns:
-                existing_subset['datetime_he'] = pd.to_datetime(existing_subset['datetime_he']).dt.tz_convert(tz)
-                existing_subset['datetime_he'] = safe_round_datetime(existing_subset['datetime_he'])
-        else:
-            existing_subset = pd.DataFrame(columns=composite_cols + [volume_col])
-        
-        # Debug: Check merge alignment before merging
-        # Only check if table exists (skip if table doesn't exist - expected to have no matches)
-        if len(existing_subset) > 0 and len(expected_df) > 0 and table_exists:
-            # Sample a few records to check if merge keys align
-            sample_existing = existing_subset[composite_cols].head(5)
-            sample_expected = expected_df[composite_cols].head(5)
-            
-            # Try to find matches
-            test_merge = sample_expected.merge(
-                sample_existing,
-                on=composite_cols,
-                how='left',
-                indicator=True
-            )
-            match_count = (test_merge['_merge'] == 'both').sum()
-            if match_count == 0 and len(sample_existing) > 0:
-                warnings.warn(
-                    f"WARNING: Merge test found 0 matches out of {len(sample_expected)} expected records. "
-                    f"This suggests a mismatch in composite columns. "
-                    f"Sample existing datetime_he: {sample_existing['datetime_he'].head(3).tolist()}, "
-                    f"Sample expected datetime_he: {sample_expected['datetime_he'].head(3).tolist()}",
-                    UserWarning
-                )
-        
-        merged = expected_df.merge(
-            existing_subset,
-            on=composite_cols,
-            how='left'
-        )
-        
-        # A record is missing if:
-        # 1. The record doesn't exist at all (volume_col is NaN), OR
-        # 2. The record exists but the volume column is blank/null/empty string
-        # NOTE: We do NOT treat 0 as blank here - legitimate zeros should not trigger API queries
-        # If we get nonzero data from API that conflicts with existing 0, we'll handle that in deduplication
-        def is_blank(val):
-            if pd.isna(val):
-                return True
-            if isinstance(val, str):
-                return val.strip() == ''
-            # Do NOT treat numeric 0 as blank - legitimate zeros should not be re-queried
-            return False
-        
-        merged['is_missing'] = merged[volume_col].apply(is_blank)
-        
-        missing_df = merged[merged['is_missing']].copy()
-        missing_df = missing_df[composite_cols].copy()  # Keep only composite columns
-        missing_df = missing_df.sort_values(by=composite_cols)
-        
-        # Safety check: If more than 90% of expected records are flagged as missing,
-        # this likely indicates a merge problem rather than actual missing data
-        # Exception: Skip this check if the table doesn't exist (expected to have 100% missing)
-        if len(expected_df) > 0 and table_exists and mis_report != 'OI_UNITRTRSV':
-            missing_pct = len(missing_df) / len(expected_df) * 100
-            if missing_pct > 90:
-                raise ValueError(
-                    f"ERROR: {missing_pct:.1f}% of expected records ({len(missing_df)}/{len(expected_df)}) "
-                    f"were flagged as missing. This suggests a merge problem (e.g., timezone mismatch, "
-                    f"column name mismatch, or data type mismatch) rather than actual missing data. "
-                    f"Aborting to prevent overwriting existing data with incorrect values. "
-                    f"Please check:\n"
-                    f"  1. Timezone alignment between expected_df and existing_data\n"
-                    f"  2. Column names match exactly\n"
-                    f"  3. Data types are compatible\n"
-                    f"  4. Sample existing records: {existing_subset.head(3) if len(existing_subset) > 0 else 'N/A'}\n"
-                    f"  5. Sample expected records: {expected_df.head(3)}"
-                )
-    else:
-        # For other tables, use the original logic
-        # If existing_data is empty, existing_subset will be empty and merge will result in all NaN
-        if len(existing_data) > 0:
-            existing_subset = existing_data[composite_cols].copy()
-            # Ensure datetime_he is in the same timezone and format as expected_df
-            if 'datetime_he' in existing_subset.columns:
-                existing_subset['datetime_he'] = pd.to_datetime(existing_subset['datetime_he']).dt.tz_convert(tz)
-                existing_subset['datetime_he'] = safe_round_datetime(existing_subset['datetime_he'])
-            existing_subset['exists'] = True
-            existing_subset = existing_subset.sort_values(by=composite_cols)
-        else:
-            existing_subset = pd.DataFrame(columns=composite_cols + ['exists'])
-        
-        # Debug: Check merge alignment before merging
-        # Only check if table exists (skip if table doesn't exist - expected to have no matches)
-        if len(existing_subset) > 0 and len(expected_df) > 0 and table_exists:
-            # Sample a few records to check if merge keys align
-            sample_existing = existing_subset[composite_cols].head(5)
-            sample_expected = expected_df[composite_cols].head(5)
-            
-            # Try to find matches
-            test_merge = sample_expected.merge(
-                sample_existing,
-                on=composite_cols,
-                how='left',
-                indicator=True
-            )
-            match_count = (test_merge['_merge'] == 'both').sum()
-            if match_count == 0 and len(sample_existing) > 0:
-                warnings.warn(
-                    f"WARNING: Merge test found 0 matches out of {len(sample_expected)} expected records. "
-                    f"This suggests a mismatch in composite columns. "
-                    f"Sample existing datetime_he: {sample_existing['datetime_he'].head(3).tolist()}, "
-                    f"Sample expected datetime_he: {sample_expected['datetime_he'].head(3).tolist()}",
-                    UserWarning
-                )
-        
-        merged = expected_df.merge(
-            existing_subset,
-            on=composite_cols,
-            how='left'
-        )
-        
-        merged = merged.sort_values(by=composite_cols)
-        missing_df = merged[merged['exists'].isna()].copy()
-        missing_df = missing_df[composite_cols].copy()
-        missing_df = missing_df.sort_values(by=composite_cols)
-        
-        # Safety check: If more than 90% of expected records are flagged as missing,
-        # this likely indicates a merge problem rather than actual missing data
-        # Exception: Skip this check if the table doesn't exist (expected to have 100% missing)
-        if len(expected_df) > 0 and table_exists and mis_report != 'OI_UNITRTRSV':
-            missing_pct = len(missing_df) / len(expected_df) * 100
-            if missing_pct > 90:
-                raise ValueError(
-                    f"ERROR: {missing_pct:.1f}% of expected records ({len(missing_df)}/{len(expected_df)}) "
-                    f"were flagged as missing. This suggests a merge problem (e.g., timezone mismatch, "
-                    f"column name mismatch, or data type mismatch) rather than actual missing data. "
-                    f"Aborting to prevent overwriting existing data with incorrect values. "
-                    f"Please check:\n"
-                    f"  1. Timezone alignment between expected_df and existing_data\n"
-                    f"  2. Column names match exactly\n"
-                    f"  3. Data types are compatible\n"
-                    f"  4. Sample existing records: {existing_subset.head(3) if len(existing_subset) > 0 else 'N/A'}\n"
-                    f"  5. Sample expected records: {expected_df.head(3)}"
-                )
-        
-        # Debug: Check for spring forward date (3/9/25) issues
-        spring_forward_date = date(2025, 3, 9)
-        if len(missing_df) > 0:
-            missing_df['date'] = missing_df['datetime_he'].dt.date
-            spring_forward_missing = missing_df[missing_df['date'] == spring_forward_date]
-            if len(spring_forward_missing) > 0:
-                print(f"\nDEBUG: Found {len(spring_forward_missing)} missing records on spring forward date {spring_forward_date}")
-                print(f"DEBUG: Unique missing datetime_he values on this date:")
-                unique_dts = spring_forward_missing['datetime_he'].unique()
-                for dt in sorted(unique_dts):
-                    print(f"  {dt} (hour: {dt.hour})")
-                # Check what exists in database for this date
-                if len(existing_data) > 0:
-                    existing_data['date'] = existing_data['datetime_he'].dt.date
-                    spring_forward_existing = existing_data[existing_data['date'] == spring_forward_date]
-                    if len(spring_forward_existing) > 0:
-                        print(f"DEBUG: Found {len(spring_forward_existing)} existing records in DB for {spring_forward_date}")
-                        print(f"DEBUG: Unique datetime_he values in DB for this date:")
-                        existing_dts = spring_forward_existing['datetime_he'].unique()
-                        for dt in sorted(existing_dts):
-                            print(f"  {dt} (hour: {dt.hour})")
-                    else:
-                        print(f"DEBUG: No existing records in DB for {spring_forward_date}")
-                # Check what's expected for this date
-                expected_df['date'] = expected_df['datetime_he'].dt.date
-                spring_forward_expected = expected_df[expected_df['date'] == spring_forward_date]
-                if len(spring_forward_expected) > 0:
-                    print(f"DEBUG: Expected {len(spring_forward_expected)} records for {spring_forward_date}")
-                    print(f"DEBUG: Unique expected datetime_he values:")
-                    expected_dts = spring_forward_expected['datetime_he'].unique()
-                    for dt in sorted(expected_dts):
-                        print(f"  {dt} (hour: {dt.hour})")
-                missing_df = missing_df.drop(columns=['date'])
-    
+
+    missing_df = find_missing_timeseries_records(
+        expected_df,
+        existing_data,
+        composite_cols,
+        value_column=volume_col,
+        treat_value_as_missing=None,  # default: NaN/empty = missing, 0 = not missing
+        table_exists=table_exists,
+        skip_high_missing_pct_check=(mis_report == 'OI_UNITRTRSV' or table_name == 'offers.flp_isone_energy'),
+    )
+
+    # Debug: optionally print spring-forward date missing vs existing vs expected
+    spring_forward_date = date(2026, 3, 8)
+    missing_df = debug_spring_forward_missing(missing_df, existing_data, expected_df, spring_forward_date)
+
     # Check if there are any missing records to query (common for both table types)
     if len(missing_df) > 0:
         # Get unique missing dates
@@ -408,69 +216,18 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         print(f"Found {len(missing_df)} missing records across {len(missing_dates)} dates")
         print(f"Missing dates: {missing_dates[:10]}...")  # Show first 10
         
-        # Group contiguous dates for efficient API queries
-        def group_contiguous_dates(dates):
-            """Group contiguous dates into ranges."""
-            if not dates:
-                return []
-            
-            groups = []
-            current_group = [dates[0]]
-            
-            for i in range(1, len(dates)):
-                if dates[i] == dates[i-1] + timedelta(days=1):
-                    current_group.append(dates[i])
-                else:
-                    groups.append(current_group)
-                    current_group = [dates[i]]
-            
-            groups.append(current_group)
-            return groups
-        
+        # Group contiguous dates for efficient API queries (from isone_update_core)
         date_groups = group_contiguous_dates(missing_dates)
-        
+
         # For OI_UNITRTRSV, segment date groups into monthly chunks to avoid API timeouts
-        # (this report has hourly data instead of daily, so it's much larger)
         if mis_report == 'OI_UNITRTRSV':
-            def segment_into_monthly_chunks(date_group):
-                """Split a date group into chunks that are at most 1 month long."""
-                if not date_group:
-                    return []
-                
-                chunks = []
-                current_chunk = [date_group[0]]
-                
-                for i in range(1, len(date_group)):
-                    current_date = date_group[i]
-                    chunk_start = current_chunk[0]
-                    
-                    # Check if adding this date would exceed 1 month
-                    # Calculate days difference
-                    days_diff = (current_date - chunk_start).days
-                    
-                    # If adding this date would exceed ~30 days, start a new chunk
-                    # Using 30 days as a safe limit (slightly less than 1 month to be safe)
-                    if days_diff >= 30:
-                        chunks.append(current_chunk)
-                        current_chunk = [current_date]
-                    else:
-                        current_chunk.append(current_date)
-                
-                # Add the last chunk
-                if current_chunk:
-                    chunks.append(current_chunk)
-                
-                return chunks
-            
-            # Segment all date groups into monthly chunks
-            segmented_groups = []
-            for group in date_groups:
-                monthly_chunks = segment_into_monthly_chunks(group)
-                segmented_groups.extend(monthly_chunks)
-            
-            date_groups = segmented_groups
+            date_groups = chunk_date_groups(date_groups, max_days=30)
             print(f"Segmented into {len(date_groups)} monthly chunks (max 30 days each) for OI_UNITRTRSV")
-        
+        # Schedule offers API: use smaller chunks to avoid timeouts
+        elif table_name == 'offers.flp_isone_energy':
+            date_groups = chunk_date_groups(date_groups, max_days=30)
+            print(f"Segmented into {len(date_groups)} monthly chunks (max 30 days each) for schedule offers API")
+
         print(f"Grouped into {len(date_groups)} contiguous date ranges")
         
         # Query API for each date range
@@ -478,25 +235,42 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
         
         for i, date_group in enumerate(date_groups):
             group_start = date_group[0].strftime('%Y-%m-%d')
-            group_end = (date_group[-1] + timedelta(days=1)).strftime('%Y-%m-%d')  # API expects exclusive end
-            if mis_report == 'OI_UNITRTRSV':
-                most_recent_version = 'false' # For OI_UNITRTRSV, reports are stored hourly and this flag appears to treat each hour as a duplicate, so it only returns HE 24
-            else:
-                most_recent_version = 'true'
-            
+            group_end = (date_group[-1] + timedelta(days=1)).strftime('%Y-%m-%d')  # MIS API expects exclusive end
             print(f"Querying API {i+1}/{len(date_groups)}: {group_start} to {group_end}")
-            
-            url = f"https://ams.pharos-ei.com/api/v2/isone/mis/downloads.csv?organization_key=ho-fl&settle_since={group_start}&settle_before={group_end}&most_recent_version={most_recent_version}&report_name={mis_report}"
-            
             try:
-                df_raw = query_ams_with_basic_auth(url, token)
-                
+                if table_name == 'offers.flp_isone_energy':
+                    group_end_inclusive = date_group[-1].strftime('%Y-%m-%d')
+                    ops_types_to_run = (
+                        ["Generation", "Pumping"]
+                        if offers_ops_type_mode == "both"
+                        else [offers_ops_type_mode]
+                    )
+                    offer_parts = []
+                    for ot in ops_types_to_run:
+                        df_part = query_schedule_offers_historic(
+                            token,
+                            organization_key="ho-fl",
+                            start_date=group_start,
+                            market=market,
+                            end_date=group_end_inclusive,
+                            ops_type=ot,
+                            timeout=120,
+                        )
+                        if len(df_part) > 0:
+                            offer_parts.append(df_part)
+                    df_raw = pd.concat(offer_parts, ignore_index=True) if offer_parts else pd.DataFrame()
+                else:
+                    if mis_report == 'OI_UNITRTRSV':
+                        most_recent_version = 'false'
+                    else:
+                        most_recent_version = 'true'
+                    url = f"https://ams.pharos-ei.com/api/v2/isone/mis/downloads.csv?organization_key=ho-fl&settle_since={group_start}&settle_before={group_end}&most_recent_version={most_recent_version}&report_name={mis_report}"
+                    df_raw = query_ams_with_basic_auth(url, token)
                 if len(df_raw) > 0:
                     all_raw_data.append(df_raw)
                     print(f"  Retrieved {len(df_raw)} rows")
                 else:
                     print(f"  No data returned for this date range")
-            
             except Exception as e:
                 print(f"  Error querying API: {e}")
                 continue
@@ -524,6 +298,10 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                     mapping_file=str(mapping_path)
                 ).data
                 df_final = prep_rtlocsum_for_quant_db(df_final)
+            elif table_name == 'offers.flp_isone_energy':
+                df_raw = pd.concat(all_raw_data, ignore_index=True)
+                df_final = process_schedule_offers_historic(df_raw, mapping_path, tz=tz)
+                df_final['datetime_he'] = df_final['datetime_hb'] + pd.Timedelta(hours=1)
             else:
                 raise ValueError("This should have caused an error already on the first line of the program that checks table names.")
                 
@@ -551,280 +329,92 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
             
             print(f"Processed {len(df_final)} rows for upload.")
 
-            # Deduplicate: Remove records that already exist in the database
+            # Deduplicate: keep only rows to insert/update (via filter_rows_for_upsert in flp_database_connector)
             print("\nDeduplicating against existing database records...")
-            
-            # Ensure datetime_he is in the same timezone for comparison
             if 'datetime_he' in df_final.columns:
                 df_final['datetime_he'] = pd.to_datetime(df_final['datetime_he']).dt.tz_convert(tz)
-                # Normalize to second precision to handle microsecond differences between databases
-                # Use safe rounding to handle ambiguous times during DST transitions
-                df_final['datetime_he'] = safe_round_datetime(df_final['datetime_he'])
-            
-            # Create a subset of df_final with composite columns for merging
-            df_final_subset_for_dedup = df_final[composite_cols].copy()
-            df_final_subset_for_dedup = df_final_subset_for_dedup.sort_values(by=composite_cols)
-            
-            if table_name == 'ops.isone_hourly_ancillary':
-                # For ancillary table, check if record exists AND volume column is populated
-                # IMPORTANT: We want to UPDATE records that exist with 0/blank values, not skip them
-                if mis_report == 'SD_DAASCLEARED':
-                    volume_col = 'da_volume'
-                elif mis_report == 'OI_UNITRTRSV':
-                    volume_col = 'rt_volume'
-                else:
-                    raise ValueError(f"For table 'ops.isone_hourly_ancillary', expected MIS reports are 'SD_DAASCLEARED' or 'OI_UNITRTRSV' but instead was {mis_report}.")
-                
-                # Helper function to check if value is blank
-                # IMPORTANT: In deduplication, treat 0 as blank so we can overwrite existing 0s with new API data
-                # This allows us to fix cases where a 0 was incorrectly stored but API now has nonzero data
-                def is_blank(val):
-                    if pd.isna(val):
-                        return True
-                    if isinstance(val, str):
-                        return val.strip() == ''
-                    # For numeric values, treat 0 as blank so we can update records that have 0
-                    try:
-                        if isinstance(val, (int, float)) and val == 0:
-                            return True
-                    except (TypeError, ValueError):
-                        pass
+                df_final['datetime_he'] = safe_round_datetime(df_final['datetime_he'], tz)
+
+            # Skip only when existing value is "good" (non-blank, non-zero); keep for update when blank/0
+            def _treat_existing_as_skip(val):
+                if pd.isna(val):
                     return False
-                
-                # Get existing records with non-blank/non-zero volume values
-                # Only skip records that already have non-zero values (to avoid overwriting good data)
-                # Records with blank/0 values should be updated, so we don't include them here
-                # Check if required columns exist and if DataFrame has data
-                required_cols = composite_cols + [volume_col]
-                if len(existing_data) == 0 or not all(col in existing_data.columns for col in required_cols):
-                    # Empty or missing columns - treat as empty
-                    existing_subset_dedup = pd.DataFrame(columns=required_cols)
-                    existing_with_zero = pd.DataFrame(columns=composite_cols)
-                else:
-                    existing_subset_dedup = existing_data[required_cols].copy()
-                    existing_subset_dedup = existing_subset_dedup.sort_values(by=composite_cols)
-                    
-                    # Identify records that exist with 0 values (for warning purposes)
-                    if len(existing_subset_dedup) > 0:
-                        existing_with_zero = existing_subset_dedup[
-                            existing_subset_dedup[volume_col].apply(is_blank)
-                        ][composite_cols].copy()
-                    else:
-                        existing_with_zero = pd.DataFrame(columns=composite_cols)
-                    
-                    # Filter to only records with non-blank/non-zero volume values
-                    # This means records with 0 or blank values will be updated with new API data
-                    if len(existing_subset_dedup) > 0:
-                        existing_subset_dedup = existing_subset_dedup[
-                            ~existing_subset_dedup[volume_col].apply(is_blank)
-                        ]
-                    existing_subset_dedup = existing_subset_dedup[composite_cols].copy()
-                
-                existing_subset_dedup['exists_in_db'] = True
-                
-                # Merge to find duplicates
-                merged_dedup = df_final_subset_for_dedup.merge(
-                    existing_subset_dedup,
-                    on=composite_cols,
-                    how='left'
+                if isinstance(val, str) and val.strip() == '':
+                    return False
+                if isinstance(val, (int, float)) and val == 0:
+                    return False
+                return True
+
+            if table_name == 'ops.isone_hourly_ancillary':
+                _vol = 'da_volume' if mis_report == 'SD_DAASCLEARED' else 'rt_volume'
+                df_to_upsert, existing_with_blank = filter_rows_for_upsert(
+                    df_final, existing_data, composite_cols,
+                    value_column=_vol, treat_existing_as_skip=_treat_existing_as_skip,
                 )
-                
-                # Keep only records that don't exist in DB with non-blank values
-                # This means: keep records that are new OR that exist but have blank/0 values (so we can update them)
-                df_final = df_final.merge(
-                    merged_dedup[composite_cols + ['exists_in_db']],
-                    on=composite_cols,
-                    how='left'
+            elif table_name == 'ops.isone_hourly_energy':
+                _vol = 'rt_volume'  # value column used for overwrite logic (energy table has da_volume + rt_volume)
+                df_to_upsert, existing_with_blank = filter_rows_for_upsert(
+                    df_final, existing_data, composite_cols,
+                    value_column=_vol, treat_existing_as_skip=_treat_existing_as_skip,
                 )
-                df_final = df_final[df_final['exists_in_db'].isna()].copy()
-                df_final = df_final.drop(columns=['exists_in_db'])
-                
-                # Check if we're overwriting any records that had 0 values with nonzero data
-                if len(existing_with_zero) > 0 and len(df_final) > 0:
-                    # Check which records in df_final correspond to existing records with 0
-                    df_final_subset_check = df_final[composite_cols + [volume_col]].copy()
-                    overwrite_check = df_final_subset_check.merge(
-                        existing_with_zero,
-                        on=composite_cols,
-                        how='inner'
-                    )
-                    
-                    # Check if any of these have nonzero values (overwriting 0)
-                    def is_nonzero(val):
-                        if pd.isna(val):
-                            return False
-                        if isinstance(val, str):
-                            return val.strip() != ''
-                        try:
-                            if isinstance(val, (int, float)):
-                                return val != 0
-                        except (TypeError, ValueError):
-                            pass
-                        return False
-                    
-                    overwriting_zero = overwrite_check[
-                        overwrite_check[volume_col].apply(is_nonzero)
-                    ]
-                    
-                    if len(overwriting_zero) > 0:
-                        warnings.warn(
-                            f"WARNING: Found {len(overwriting_zero)} records where existing database value was 0, "
-                            f"but API returned nonzero data. These will be updated.\n"
-                            f"Sample records being overwritten:\n{overwriting_zero[composite_cols + [volume_col]].head(10).to_string()}",
-                            UserWarning
-                        )
-                
             else:
-                # For other tables, just check if record exists
-                existing_subset_dedup = existing_data[composite_cols].copy()
-                existing_subset_dedup['exists_in_db'] = True
-                existing_subset_dedup = existing_subset_dedup.sort_values(by=composite_cols)
-                
-                # Merge to find duplicates
-                merged_dedup = df_final_subset_for_dedup.merge(
-                    existing_subset_dedup,
-                    on=composite_cols,
-                    how='left'
+                df_to_upsert, existing_with_blank = filter_rows_for_upsert(
+                    df_final, existing_data, composite_cols,
                 )
-                
-                # Keep only records that don't exist in DB
-                df_final = df_final.merge(
-                    merged_dedup[composite_cols + ['exists_in_db']],
-                    on=composite_cols,
-                    how='left'
+            df_final = df_to_upsert
+
+            # Warn when overwriting existing 0/blank with nonzero data
+            if table_name in ('ops.isone_hourly_ancillary', 'ops.isone_hourly_energy') and len(existing_with_blank) > 0 and len(df_final) > 0:
+                if table_name == 'ops.isone_hourly_ancillary':
+                    _vol = 'da_volume' if mis_report == 'SD_DAASCLEARED' else 'rt_volume'
+                else:
+                    _vol = 'rt_volume'
+                overwrite_check = df_final[composite_cols + [_vol]].merge(
+                    existing_with_blank, on=composite_cols, how='inner'
                 )
-                df_final = df_final[df_final['exists_in_db'].isna()].copy()
-                df_final = df_final.drop(columns=['exists_in_db'])
-            
+                def _is_nonzero(val):
+                    if pd.isna(val):
+                        return False
+                    if isinstance(val, str):
+                        return val.strip() != ''
+                    try:
+                        return isinstance(val, (int, float)) and val != 0
+                    except (TypeError, ValueError):
+                        return False
+                overwriting_zero = overwrite_check[overwrite_check[_vol].apply(_is_nonzero)]
+                if len(overwriting_zero) > 0:
+                    warnings.warn(
+                        f"WARNING: Found {len(overwriting_zero)} records where existing database value was 0, "
+                        f"but API returned nonzero data. These will be updated.\n"
+                        f"Sample records being overwritten:\n{overwriting_zero[composite_cols + [_vol]].head(10).to_string()}",
+                        UserWarning
+                    )
+
             print(f"After deduplication: {len(df_final)} rows remaining for upload.")
             
             # Skip upload if no data to upload
             if len(df_final) == 0:
                 print("No data to upload after deduplication. Skipping upload.")
             else:
-                # Check for any remaining missing data and fill with 0s if fill_with_zeros is True
-                if fill_with_zeros:
-                    print("\nChecking for any remaining missing data to fill with zeros...")
-                    
-                    # Get the datetime range from API data (not just dates, to handle partial days)
-                    if 'datetime_he' in df_final.columns:
-                        # Find the minimum and maximum datetime_he with actual data
-                        min_api_datetime = df_final['datetime_he'].min() if len(df_final) > 0 else None
-                        max_api_datetime = df_final['datetime_he'].max() if len(df_final) > 0 else None
-                        
-                        if min_api_datetime is not None and max_api_datetime is not None:
-                            print(f"Data range: {min_api_datetime} to {max_api_datetime}")
-                            
-                            # Filter expected_df to only include records between min and max datetimes (inclusive)
-                            # This ensures we only fill gaps between legitimate data, not before or after
-                            # This also handles partial days - if data starts at hour 10, we won't fill hours 1-9
-                            expected_df_filtered = expected_df[
-                                (expected_df['datetime_he'] >= min_api_datetime) & 
-                                (expected_df['datetime_he'] <= max_api_datetime)
-                            ].copy()
-                        else:
-                            expected_df_filtered = pd.DataFrame(columns=expected_df.columns)
-                    else:
-                        # Can't extract datetimes, so skip filling
-                        expected_df_filtered = pd.DataFrame(columns=expected_df.columns)
-                        min_api_datetime = None
-                        max_api_datetime = None
-                    
-                    if len(expected_df_filtered) > 0:
-                        df_final_subset = df_final[composite_cols].copy()
-                        df_final_subset['exists'] = True
-                        df_final_subset = df_final_subset.sort_values(by=composite_cols)
-                        
-                        merged_updated = expected_df_filtered.merge(
-                            df_final_subset,
-                            on=composite_cols,
-                            how='left'
-                        )
-                        
-                        still_missing_df = merged_updated[merged_updated['exists'].isna()].copy()
-                        still_missing_df = still_missing_df[composite_cols].copy()
-                        
-                        if len(still_missing_df) > 0:
-                            # Only fill gaps between min and max datetimes (already filtered above)
-                            if 'datetime_he' in still_missing_df.columns:
-                                still_missing_to_fill = still_missing_df[composite_cols].copy()
-                                
-                                if len(still_missing_to_fill) > 0:
-                                    print(f"\nFilling {len(still_missing_to_fill)} missing combinations with default values (0) "
-                                          f"for gaps between {min_api_datetime} and {max_api_datetime}...")
-                                    
-                                    # Fill in default values
-                                    initial_fill_count = len(still_missing_to_fill)
-                                    if table_name == 'ops.isone_hourly_ancillary':
-                                        if mis_report == 'SD_DAASCLEARED':
-                                            still_missing_to_fill['da_volume'] = 0
-                                            still_missing_to_fill['rt_volume'] = pd.NA  # Use pd.NA instead of "" for numeric column
-                                            still_missing_to_fill['unit'] = "MW"
-                                            still_missing_to_fill['interval_width_s'] = 3600
-                                            mapping = retrieve_isone_location_map(mapping_path)
-                                            mapping = mapping[["ISO-NE Name", "FLP Asset Name"]]
-                                            mapping.rename(columns={"ISO-NE Name":"name", "FLP Asset Name":"asset"}, inplace=True)
-                                            # Remove duplicates from mapping to prevent merge from creating duplicates
-                                            mapping = mapping.drop_duplicates(subset=['name'], keep='first')
-                                            still_missing_to_fill = still_missing_to_fill.merge(mapping, how="left", on="name")
-                                        elif mis_report == 'OI_UNITRTRSV':
-                                            still_missing_to_fill['da_volume'] = pd.NA  # Use pd.NA instead of "" for numeric column
-                                            still_missing_to_fill['rt_volume'] = 0
-                                            still_missing_to_fill['unit'] = "MW"
-                                            still_missing_to_fill['interval_width_s'] = 3600
-                                            mapping = retrieve_isone_location_map(mapping_path)
-                                            mapping = mapping[["ISO-NE Name", "FLP Asset Name"]]
-                                            mapping.rename(columns={"ISO-NE Name":"name", "FLP Asset Name":"asset"}, inplace=True)
-                                            # Remove duplicates from mapping to prevent merge from creating duplicates
-                                            mapping = mapping.drop_duplicates(subset=['name'], keep='first')
-                                            still_missing_to_fill = still_missing_to_fill.merge(mapping, how="left", on="name")
-                                    elif table_name == 'ops.isone_hourly_energy':
-                                        still_missing_to_fill['da_volume'] = 0
-                                        still_missing_to_fill['rt_volume'] = 0
-                                        still_missing_to_fill['unit'] = "MWh"
-                                        still_missing_to_fill['interval_width_s'] = 3600
-                                        mapping = retrieve_isone_location_map(mapping_path)
-                                        mapping = mapping[["ISO-NE Name", "FLP Asset Name"]]
-                                        mapping.rename(columns={"ISO-NE Name":"name", "FLP Asset Name":"asset"}, inplace=True)
-                                        # Remove duplicates from mapping to prevent merge from creating duplicates
-                                        mapping = mapping.drop_duplicates(subset=['name'], keep='first')
-                                        still_missing_to_fill = still_missing_to_fill.merge(mapping, how="left", on="name")
-                                    else:
-                                        raise ValueError("This should have caused a table name error already in 2 other places.")
-                                    
-                                    # Check if merge created duplicates
-                                    if len(still_missing_to_fill) > initial_fill_count:
-                                        print(f"WARNING: Merge with mapping created duplicates! "
-                                              f"Before merge: {initial_fill_count}, After merge: {len(still_missing_to_fill)}")
-                                        # Deduplicate after merge
-                                        still_missing_to_fill = still_missing_to_fill.drop_duplicates(subset=composite_cols, keep='first')
-                                        if len(still_missing_to_fill) != initial_fill_count:
-                                            print(f"After deduplication: {len(still_missing_to_fill)} records "
-                                                  f"(expected {initial_fill_count})")
-                                    
-                                    # Check for duplicates in still_missing_to_fill before appending
-                                    initial_fill_count = len(still_missing_to_fill)
-                                    still_missing_to_fill = still_missing_to_fill.drop_duplicates(subset=composite_cols, keep='first')
-                                    if len(still_missing_to_fill) < initial_fill_count:
-                                        print(f"WARNING: Removed {initial_fill_count - len(still_missing_to_fill)} duplicate records from filled missing combos")
-                                    
-                                    # Append the default-filled records to df_final
-                                    df_final = pd.concat([df_final, still_missing_to_fill], ignore_index=True)
-                                    print(f"Added {len(still_missing_to_fill)} records with default values.")
-                                else:
-                                    print("No missing combinations found to fill.")
-                            else:
-                                # Can't extract datetimes, so warn but don't fill
-                                warnings.warn(
-                                    f"WARNING: Found {len(still_missing_df)} records that were expected but not returned by API.\n"
-                                    f"Cannot determine datetime range, so these will NOT be filled.",
-                                    UserWarning
-                                )
-                        else:
-                            print("No missing records found between data range.")
-                    else:
-                        print("No expected records in data range to check for missing data.")
-                else:
+                # # Debug: for offers table, compare new vs existing columns before upload
+                # if table_name == 'offers.flp_isone_energy' and table_exists:
+                #     new_cols = set(df_final.columns)
+                #     existing_cols = set(existing_data.columns)
+                #     only_in_new = sorted(new_cols - existing_cols)
+                #     only_in_existing = sorted(existing_cols - new_cols)
+                #     print(f"\nDEBUG (offers.flp_isone_energy):")
+                #     print(f"  Columns only in new data: {only_in_new}")
+                #     print(f"  Columns only in existing table: {only_in_existing}")
+
+                if fill_with_zeros and table_name != 'offers.flp_isone_energy':
+                    mapping = retrieve_isone_location_map(mapping_path)
+                    mapping_df = mapping[["ISO-NE Name", "FLP Asset Name"]].rename(
+                        columns={"ISO-NE Name": "name", "FLP Asset Name": "asset"}
+                    ).drop_duplicates(subset=["name"], keep="first")
+                    df_final = fill_missing_with_defaults(
+                        df_final, expected_df, composite_cols, table_name, mis_report, mapping_df
+                    )
+                elif not fill_with_zeros:
                     print("\nfill_with_zeros is False - skipping zero-filling step.")
             #     print(f"WARNING: Found {len(still_missing_df)} records that were expected but not returned by API.")
             #     print("These records will be filled with default values (0).")
@@ -917,9 +507,17 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                     # Ensure the dtype is numeric (float64 to handle NaN values)
                     df_final['rt_volume'] = df_final['rt_volume'].astype('float64')
 
-                # Upload to database
+                # Upload to database (create table if it doesn't exist, else update/append)
                 print("Uploading to database...")
-                if table_name == 'ops.isone_hourly_energy':
+                if not table_exists:
+                    db_conn.upload_data_to_quant_db(
+                        table_name=table_name,
+                        df=df_final,
+                        tz=tz,
+                        mode="create",
+                        skip_prompt=True,
+                    )
+                elif table_name == 'ops.isone_hourly_energy':
                     db_conn.upload_data_to_quant_db(
                         table_name=table_name,
                         df=df_final,
@@ -929,16 +527,12 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                         skip_prompt=True
                     )
                 elif table_name == 'ops.isone_hourly_ancillary':
-                    # For ancillary table, we need to update existing records or insert new ones
-                    # Determine which column we're updating based on mis_report
                     if mis_report == 'SD_DAASCLEARED':
                         volume_col = 'da_volume'
                     elif mis_report == 'OI_UNITRTRSV':
                         volume_col = 'rt_volume'
                     else:
                         raise ValueError(f"For table 'ops.isone_hourly_ancillary', expected MIS reports are 'SD_DAASCLEARED' or 'OI_UNITRTRSV' but instead was {mis_report}.")
-                    
-                    # Use the update mode to update the volume column and insert new records
                     db_conn.upload_data_to_quant_db(
                         table_name=table_name,
                         df=df_final,
@@ -948,7 +542,6 @@ def automated_isone_data_update(username, token, table_name, tz, mis_report, sta
                         skip_prompt=True
                     )
                 else:
-                    # For other tables, use original append method
                     db_conn.upload_data_to_quant_db(
                         table_name=table_name,
                         df=df_final,

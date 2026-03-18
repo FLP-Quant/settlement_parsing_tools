@@ -276,6 +276,7 @@ def query_schedule_offers_historic(
     timeout: int = 30,
     save_to_file: Optional[str] = None,
     csv_read_kwargs: Optional[dict] = None,
+    ops_type: Optional[str] = "Generation",
 ) -> pd.DataFrame:
     """
     Query the ISONE schedule offer price data (historic) API.
@@ -305,6 +306,8 @@ def query_schedule_offers_historic(
         If provided, the raw CSV response is saved to this path.
     csv_read_kwargs : dict, optional
         Extra kwargs passed to pd.read_csv when parsing the response.
+    ops_type: Optional[str], optional
+        One of: 'Generation', 'Pumping'. Default 'Generation'.
 
     Returns
     -------
@@ -321,7 +324,14 @@ def query_schedule_offers_historic(
     if market not in allowed:
         raise ValueError(f"market must be one of {allowed!r}, got {market!r}")
 
-    path = "/api/isone/schedule_offers/historic"
+    if ops_type == "Generation":
+        path = "/api/isone/schedule_offers/historic"
+    elif ops_type == "Pumping":
+        # ARD endpoint (per docs): /api/isone/ard/schedule_offers/historic
+        path = "/api/isone/ard/schedule_offers/historic"
+    else:
+        raise ValueError("ops_type must be one of ('Generation', 'Pumping')")
+
     params = {
         "organization_key": organization_key,
         "start_date": start_date.strip(),
@@ -332,13 +342,17 @@ def query_schedule_offers_historic(
 
     url = f"{base_url.rstrip('/')}{path}?{urlencode(params)}"
 
-    return query_ams_with_basic_auth(
+    df = query_ams_with_basic_auth(
         url,
         api_token,
         timeout=timeout,
         save_to_file=save_to_file,
         csv_read_kwargs=csv_read_kwargs or {},
     )
+    if not df.empty:
+        df = df.copy()
+        df["ops_type"] = ops_type
+    return df
 
 
 def process_schedule_offers_historic(
@@ -351,7 +365,8 @@ def process_schedule_offers_historic(
     Post-process raw schedule offers historic DataFrame to match project conventions.
 
     - Drops all columns to the right of price_9 (keeps 28 columns).
-    - Keeps only sched_type_id == 12 (price-based; 95-99 are cost-based per ISO-NE).
+    - Keeps only schedule_type_id == 12 (price-based; 95-99 are cost-based per ISO-NE).
+      Generation uses sched_type_id; Pumping (ARD) uses ard_sched_type_id / ard_schedule_type_id.
     - Drops rows where hour_ending == "Default".
     - Maps unit_id/unit_name/iso_id to name and asset via ISONE Location Mapping.
     - Converts timestamp to datetime_he with timezone.
@@ -360,15 +375,33 @@ def process_schedule_offers_historic(
     if df.empty:
         return df.copy()
 
+    # Preserve ops_type if query function added it; the column may appear to the right of price_9
+    # and would otherwise be dropped by the slice below.
+    ops_type_col = df["ops_type"].copy() if "ops_type" in df.columns else None
+
     # Drop all columns to the right of "price_9" (keeps 28 columns)
     if "price_9" not in df.columns:
         raise ValueError("Expected column 'price_9' in schedule offers data")
     idx = df.columns.get_loc("price_9")
     df = df.iloc[:, : idx + 1].copy()
+    if ops_type_col is not None:
+        df["ops_type"] = ops_type_col
 
     # Per ISO-NE eMarket Users Guide: 0-94 are price-based schedules, 95-99 are
     # cost-based schedules reserved for use by ISO New England. Keep only 12.
-    df = df[df["sched_type_id"] == 12].copy()
+    sched_col = None
+    if "sched_type_id" in df.columns:
+        sched_col = "sched_type_id"
+    elif "ard_sched_type_id" in df.columns:
+        sched_col = "ard_sched_type_id"
+    elif "ard_schedule_type_id" in df.columns:
+        sched_col = "ard_schedule_type_id"
+    if sched_col is None:
+        raise ValueError(
+            "Expected one of 'sched_type_id', 'ard_sched_type_id', or 'ard_schedule_type_id' "
+            f"in schedule offers data. Columns: {list(df.columns)}"
+        )
+    df = df[df[sched_col] == 12].copy()
 
     # Filter out placeholder rows
     df = df[df["hour_ending"] != "Default"].copy()
@@ -385,7 +418,10 @@ def process_schedule_offers_historic(
         how="left",
     )
     df = df.rename(columns={"FLP Asset Name": "asset", "ISO-NE Name": "name"})
-    df = df.drop(columns=["unit_id", "unit_name", "iso_id", "sched_type_id"], errors="ignore")
+    df = df.drop(
+        columns=["unit_id", "unit_name", "iso_id", "sched_type_id", "ard_sched_type_id", "ard_schedule_type_id", "firm"],
+        errors="ignore",
+    )
 
     # timestamp is hour-ending time; align with project convention as datetime_hb
     df["datetime_hb"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(tz)
@@ -393,9 +429,21 @@ def process_schedule_offers_historic(
 
     # Add columns consistent with other tables
     df["service"] = "energy"
-    df["ops_type"] = "generation"
+    # ops_type is added upstream in query_schedule_offers_historic
 
     # Rename market for clarity
     df = df.rename(columns={"market": "market_type"})
+
+    # Enforce column order so Generation and Pumping outputs match (avoids append mismatches)
+    SCHEDULE_OFFERS_COLUMN_ORDER = [
+        "hour_ending", "market_type", "mw_0", "price_0", "mw_1", "price_1", "mw_2", "price_2",
+        "mw_3", "price_3", "mw_4", "price_4", "mw_5", "price_5", "mw_6", "price_6",
+        "mw_7", "price_7", "mw_8", "price_8", "mw_9", "price_9",
+        "name", "asset", "datetime_hb", "service", "ops_type", "datetime_he",
+        "update_timestamp", "update_user", "date", "he",
+    ]
+    order_cols = [c for c in SCHEDULE_OFFERS_COLUMN_ORDER if c in df.columns]
+    extra = [c for c in df.columns if c not in SCHEDULE_OFFERS_COLUMN_ORDER]
+    df = df[order_cols + extra]
 
     return df
