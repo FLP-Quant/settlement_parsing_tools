@@ -50,7 +50,7 @@ def automated_isone_data_update(
 ):
     """
     mis_report : used for ops.isone_hourly_ancillary (e.g. 'SD_DAASCLEARED', 'OI_UNITRTRSV').
-    market : used for offers.flp_isone_energy (e.g. 'day_ahead', 'reoffer', 'real_time'); default 'day_ahead'.
+    market : used for offers.flp_isone_energy: 'DA' (day-ahead) or 'RT' (real-time). Default 'DA'.
     """
     supported_tables = ['ops.isone_hourly_ancillary', 'ops.isone_hourly_energy', 'offers.flp_isone_energy']
     if table_name not in supported_tables:
@@ -58,9 +58,9 @@ def automated_isone_data_update(
 
     if table_name == 'offers.flp_isone_energy':
         if market is None:
-            market = 'day_ahead'
-        if market not in ('day_ahead', 'reoffer', 'real_time'):
-            raise ValueError(f"market must be one of 'day_ahead', 'reoffer', 'real_time', got {market!r}")
+            market = 'DA'
+        if market not in ('DA', 'RT'):
+            raise ValueError(f"market must be one of 'DA', 'RT', got {market!r}")
         if offers_ops_type_mode not in ("both", "Generation", "Pumping"):
             raise ValueError(
                 f"offers_ops_type_mode must be one of 'both', 'Generation', 'Pumping', got {offers_ops_type_mode!r}"
@@ -245,13 +245,15 @@ def automated_isone_data_update(
                         if offers_ops_type_mode == "both"
                         else [offers_ops_type_mode]
                     )
+                    # API expects day_ahead/real_time/reoffer; we use DA/RT/reoffer in app
+                    api_market = {"DA": "day_ahead", "RT": "real_time"}.get(market, market)
                     offer_parts = []
                     for ot in ops_types_to_run:
                         df_part = query_schedule_offers_historic(
                             token,
                             organization_key="ho-fl",
                             start_date=group_start,
-                            market=market,
+                            market=api_market,
                             end_date=group_end_inclusive,
                             ops_type=ot,
                             timeout=120,

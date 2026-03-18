@@ -56,7 +56,7 @@ class TestAutomatedIsoneDataUpdateValidation:
                 "user", "token",
                 table_name="offers.flp_isone_energy",
                 tz="America/New_York",
-                market="day_ahead",
+                market="DA",
                 offers_ops_type_mode="Invalid",
             )
 

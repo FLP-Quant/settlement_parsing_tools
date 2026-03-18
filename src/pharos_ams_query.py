@@ -320,7 +320,8 @@ def query_schedule_offers_historic(
         If market is not one of day_ahead, reoffer, real_time.
     """
     market = market.strip().lower()
-    allowed = ("day_ahead", "reoffer", "real_time")
+    # API accepts day_ahead, real_time, reoffer (caller may pass these from DA/RT conversion)
+    allowed = ("day_ahead", "real_time", "reoffer")
     if market not in allowed:
         raise ValueError(f"market must be one of {allowed!r}, got {market!r}")
 
@@ -422,15 +423,16 @@ def process_schedule_offers_historic(
     df["service"] = "energy"
     # ops_type is added upstream in query_schedule_offers_historic
 
-    # Rename market for clarity
+    # Rename market for clarity and normalize to DA/RT (API returns day_ahead/real_time)
     df = df.rename(columns={"market": "market_type"})
+    df["market_type"] = df["market_type"].replace({"day_ahead": "DA", "real_time": "RT"})
 
     # Enforce column order so Generation and Pumping outputs match (avoids append mismatches)
     SCHEDULE_OFFERS_COLUMN_ORDER = [
-        "hour_ending", "market_type", "mw_0", "price_0", "mw_1", "price_1", "mw_2", "price_2",
+        "datetime_hb", "market_type", "mw_0", "price_0", "mw_1", "price_1", "mw_2", "price_2",
         "mw_3", "price_3", "mw_4", "price_4", "mw_5", "price_5", "mw_6", "price_6",
         "mw_7", "price_7", "mw_8", "price_8", "mw_9", "price_9",
-        "name", "asset", "datetime_hb", "service", "ops_type", "datetime_he",
+        "name", "asset", "service", "ops_type", "datetime_he",
         "update_timestamp", "update_user", "date", "he",
     ]
     order_cols = [c for c in SCHEDULE_OFFERS_COLUMN_ORDER if c in df.columns]
