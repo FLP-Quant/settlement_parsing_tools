@@ -1,6 +1,8 @@
 import base64
+import json
 import io
 import os
+import ast
 from urllib.parse import urlencode
 import requests
 import pandas as pd
@@ -277,6 +279,7 @@ def query_schedule_offers_historic(
     save_to_file: Optional[str] = None,
     csv_read_kwargs: Optional[dict] = None,
     ops_type: Optional[str] = "Generation",
+    offer_product: str = "energy",
 ) -> pd.DataFrame:
     """
     Query the ISONE schedule offer price data (historic) API.
@@ -308,6 +311,8 @@ def query_schedule_offers_historic(
         Extra kwargs passed to pd.read_csv when parsing the response.
     ops_type: Optional[str], optional
         One of: 'Generation', 'Pumping'. Default 'Generation'.
+    offer_product : str, optional
+        One of: 'energy', 'ancillary'. Controls the API endpoint path used.
 
     Returns
     -------
@@ -325,13 +330,25 @@ def query_schedule_offers_historic(
     if market not in allowed:
         raise ValueError(f"market must be one of {allowed!r}, got {market!r}")
 
-    if ops_type == "Generation":
-        path = "/api/isone/schedule_offers/historic"
-    elif ops_type == "Pumping":
-        # ARD endpoint (per docs): /api/isone/ard/schedule_offers/historic
-        path = "/api/isone/ard/schedule_offers/historic"
+    offer_product = offer_product.strip().lower()
+    if offer_product not in ("energy", "ancillary"):
+        raise ValueError("offer_product must be one of ('energy', 'ancillary')")
+
+    if offer_product == "energy":
+        if ops_type == "Generation":
+            path = "/api/isone/schedule_offers/historic"
+        elif ops_type == "Pumping":
+            # ARD endpoint (per docs): /api/isone/ard/schedule_offers/historic
+            path = "/api/isone/ard/schedule_offers/historic"
+        else:
+            raise ValueError("ops_type must be one of ('Generation', 'Pumping')")
     else:
-        raise ValueError("ops_type must be one of ('Generation', 'Pumping')")
+        if ops_type == "Generation":
+            path = "/api/isone/unit/ancillary_service/schedule_offer_hourly/historic"
+        elif ops_type == "Pumping":
+            path = "/api/isone/ard/ancillary_service/schedule_offer_hourly/historic"
+        else:
+            raise ValueError("ops_type must be one of ('Generation', 'Pumping')")
 
     params = {
         "organization_key": organization_key,
@@ -427,16 +444,279 @@ def process_schedule_offers_historic(
     df = df.rename(columns={"market": "market_type"})
     df["market_type"] = df["market_type"].replace({"day_ahead": "DA", "real_time": "RT"})
 
-    # Enforce column order so Generation and Pumping outputs match (avoids append mismatches)
+    # Max Daily Award Limit (MDAL) — keep when the API provides it (alternate spellings).
+    if "max_daily_award_limit" not in df.columns:
+        for alt in ("MaxDailyAwardLimit", "maxDailyAwardLimit", "mdal", "MDAL"):
+            if alt in df.columns:
+                df = df.rename(columns={alt: "max_daily_award_limit"})
+                break
+
+    # Keep only the canonical table columns so new API fields do not break DB append.
+    # This still preserves the expected schedule-offers payload used downstream.
     SCHEDULE_OFFERS_COLUMN_ORDER = [
         "datetime_hb", "market_type", "mw_0", "price_0", "mw_1", "price_1", "mw_2", "price_2",
         "mw_3", "price_3", "mw_4", "price_4", "mw_5", "price_5", "mw_6", "price_6",
         "mw_7", "price_7", "mw_8", "price_8", "mw_9", "price_9",
         "name", "asset", "service", "ops_type", "datetime_he",
+        "max_daily_award_limit",
         "update_timestamp", "update_user", "date", "he",
     ]
     order_cols = [c for c in SCHEDULE_OFFERS_COLUMN_ORDER if c in df.columns]
-    extra = [c for c in df.columns if c not in SCHEDULE_OFFERS_COLUMN_ORDER]
-    df = df[order_cols + extra]
+    df = df[order_cols]
+
+    if "max_daily_award_limit" in df.columns:
+        df["max_daily_award_limit"] = pd.to_numeric(
+            df["max_daily_award_limit"], errors="coerce"
+        )
 
     return df
+
+
+def process_ancillary_schedule_offers_historic(
+    df: pd.DataFrame,
+    mapping_path: str,
+    *,
+    tz: str = "America/New_York",
+) -> pd.DataFrame:
+    """
+    Post-process raw ancillary schedule offers (generation + ARD) into DB-ready format.
+
+    Output schema mirrors the standardized offers workflow:
+    - datetime_hb (tz-aware), datetime_he
+    - market_type (DA/RT), ops_type
+    - name, asset, service
+    - da_volume (from MW), price (service-specific ancillary offer price)
+    - max_daily_award_limit (MDAL) when present in the API payload
+    """
+    if df.empty:
+        return df.copy()
+
+    df = df.copy()
+
+    # Some ancillary endpoints return nested payload rows like:
+    # columns ['schedule_offer_hourly', 'ops_type'] where schedule_offer_hourly
+    # contains JSON/list records. Expand those into a flat DataFrame first.
+    if "schedule_offer_hourly" in df.columns:
+        expanded_rows = []
+        for _, row in df.iterrows():
+            payload = row.get("schedule_offer_hourly")
+            row_ops_type = row.get("ops_type")
+
+            # Parse payload if it's a JSON/string container.
+            if isinstance(payload, str):
+                parsed = None
+                for parser in (json.loads, ast.literal_eval):
+                    try:
+                        parsed = parser(payload)
+                        break
+                    except Exception:
+                        continue
+                payload = parsed if parsed is not None else payload
+
+            # Normalize payload into list[dict]
+            records = []
+            if isinstance(payload, dict):
+                if "schedule_offer_hourly" in payload:
+                    inner = payload["schedule_offer_hourly"]
+                    if isinstance(inner, list):
+                        records.extend(inner)
+                    elif isinstance(inner, dict):
+                        records.append(inner)
+                else:
+                    records.append(payload)
+            elif isinstance(payload, list):
+                records.extend(payload)
+
+            for rec in records:
+                if isinstance(rec, dict):
+                    rec = rec.copy()
+                    if "ops_type" not in rec and row_ops_type is not None:
+                        rec["ops_type"] = row_ops_type
+                    expanded_rows.append(rec)
+
+        if expanded_rows:
+            df = pd.json_normalize(expanded_rows)
+        else:
+            raise ValueError(
+                "Ancillary offers payload appears nested, but could not be expanded. "
+                f"Incoming columns: {list(df.columns)}"
+            )
+
+    if "max_daily_award_limit" not in df.columns:
+        for alt in ("MaxDailyAwardLimit", "maxDailyAwardLimit", "mdal", "MDAL"):
+            if alt in df.columns:
+                df = df.rename(columns={alt: "max_daily_award_limit"})
+                break
+
+    # Filter out placeholder rows if present
+    if "hour_ending" in df.columns:
+        df = df[df["hour_ending"] != "Default"].copy()
+
+    # Match the energy offers behavior: keep the standard price-based schedule.
+    # Ancillary offers use schedule_id for the same schedule dimension that would
+    # otherwise create multiple rows for the same hour/resource/service key.
+    if "schedule_id" in df.columns:
+        schedule_id = pd.to_numeric(df["schedule_id"], errors="coerce")
+        before_schedule_filter = len(df)
+        df = df[schedule_id == 12].copy()
+        removed_schedule_rows = before_schedule_filter - len(df)
+        if removed_schedule_rows > 0:
+            print(
+                f"Filtered ancillary offers to schedule_id == 12; "
+                f"removed {removed_schedule_rows} non-target schedule rows."
+            )
+
+    # Normalize known service price columns from API/XML conventions
+    service_price_map = {
+        "tmsrprice": "TMSR",
+        "tmsr_price": "TMSR",
+        "tmsr": "TMSR",
+        "tmnsrprice": "TMNSR",
+        "tmnsr_price": "TMNSR",
+        "tmnsr": "TMNSR",
+        "tmorprice": "TMOR",
+        "tmor_price": "TMOR",
+        "tmor": "TMOR",
+        "eirprice": "EIR",
+        "eir_price": "EIR",
+        "eir": "EIR",
+    }
+    normalized_cols = {c.lower(): c for c in df.columns}
+    available_price_cols = []
+    for k in service_price_map:
+        if k in normalized_cols:
+            available_price_cols.append(normalized_cols[k])
+    if not available_price_cols:
+        raise ValueError(
+            "Expected at least one ancillary service price column in data "
+            "(TmsrPrice/TmnsrPrice/TmorPrice/EirPrice). "
+            f"Columns: {list(df.columns)}"
+        )
+
+    # Melt wide service columns to long service rows
+    id_vars = [c for c in df.columns if c not in available_price_cols]
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=available_price_cols,
+        var_name="service_col",
+        value_name="price",
+    )
+    melted["service"] = (
+        melted["service_col"]
+        .astype(str)
+        .str.lower()
+        .map(service_price_map)
+    )
+    melted = melted[melted["service"].notna()].copy()
+    melted = melted.drop(columns=["service_col"], errors="ignore")
+
+    # Drop rows where price is unavailable (0 is valid, NaN is not)
+    melted["price"] = pd.to_numeric(melted["price"], errors="coerce")
+    melted = melted[melted["price"].notna()].copy()
+
+    # Volume column from MW
+    mw_col = None
+    for candidate in ("MW", "mw", "da_volume", "volume"):
+        if candidate in melted.columns:
+            mw_col = candidate
+            break
+    if mw_col is None:
+        raise ValueError(
+            "Expected ancillary offers MW column ('MW' or 'mw') in data. "
+            f"Columns: {list(melted.columns)}"
+        )
+    melted["da_volume"] = pd.to_numeric(melted[mw_col], errors="coerce")
+
+    # Standardize market to market_type and DA/RT naming
+    if "market" in melted.columns and "market_type" not in melted.columns:
+        melted = melted.rename(columns={"market": "market_type"})
+    if "market_type" in melted.columns:
+        melted["market_type"] = (
+            melted["market_type"]
+            .replace({"day_ahead": "DA", "real_time": "RT"})
+        )
+    else:
+        # Default to DA if upstream payload omits market_type (common in DA hourly exports)
+        melted["market_type"] = "DA"
+
+    # Map resource identifiers to standardized name + asset.
+    # Ancillary payloads commonly use pnode_id/location instead of unit_name.
+    mapping = retrieve_isone_location_map(mapping_path)
+    mapping_name = mapping[["ISO-NE Name", "FLP Asset Name"]].drop_duplicates(
+        subset=["ISO-NE Name"], keep="first"
+    )
+
+    mapped = False
+    if "pnode_id" in melted.columns and "PNode ID" in mapping.columns:
+        mapping_pnode = mapping[["PNode ID", "ISO-NE Name", "FLP Asset Name"]].dropna(
+            subset=["PNode ID"]
+        ).drop_duplicates(subset=["PNode ID"], keep="last")
+        melted["pnode_id"] = melted["pnode_id"].astype(str)
+        mapping_pnode["PNode ID"] = mapping_pnode["PNode ID"].astype(str)
+        melted = melted.merge(
+            mapping_pnode,
+            left_on="pnode_id",
+            right_on="PNode ID",
+            how="left",
+        )
+        melted = melted.rename(columns={"ISO-NE Name": "name", "FLP Asset Name": "asset"})
+        mapped = True
+
+    # Fallback: map by location/name-like fields where pnode_id mapping did not apply.
+    if not mapped or "name" not in melted.columns or melted["name"].isna().all():
+        name_key = None
+        for candidate in ("unit_name", "short_name", "name", "location"):
+            if candidate in melted.columns:
+                name_key = candidate
+                break
+        if name_key is None:
+            raise ValueError(
+                "Could not map ancillary offers to assets. Expected one of "
+                "'pnode_id', 'unit_name', 'short_name', 'name', or 'location' in payload. "
+                f"Columns: {list(melted.columns)}"
+            )
+        fallback = melted.merge(
+            mapping_name,
+            left_on=name_key,
+            right_on="ISO-NE Name",
+            how="left",
+        ).rename(columns={"ISO-NE Name": "name_fallback", "FLP Asset Name": "asset_fallback"})
+
+        if "name" in fallback.columns:
+            fallback["name"] = fallback["name"].fillna(fallback["name_fallback"])
+        else:
+            fallback["name"] = fallback["name_fallback"]
+        if "asset" in fallback.columns:
+            fallback["asset"] = fallback["asset"].fillna(fallback["asset_fallback"])
+        else:
+            fallback["asset"] = fallback["asset_fallback"]
+        melted = fallback.drop(columns=["name_fallback", "asset_fallback"], errors="ignore")
+
+    # Convert timestamps
+    time_col = "timestamp" if "timestamp" in melted.columns else ("time" if "time" in melted.columns else None)
+    if time_col is None:
+        raise ValueError(
+            "Expected 'timestamp' or 'time' column in ancillary offers data. "
+            f"Columns: {list(melted.columns)}"
+        )
+    melted["datetime_hb"] = pd.to_datetime(melted[time_col], utc=True).dt.tz_convert(tz)
+    melted["datetime_he"] = melted["datetime_hb"] + pd.Timedelta(hours=1)
+
+    if "max_daily_award_limit" in melted.columns:
+        melted["max_daily_award_limit"] = pd.to_numeric(
+            melted["max_daily_award_limit"], errors="coerce"
+        )
+    else:
+        melted["max_daily_award_limit"] = pd.NA
+
+    # Keep final standardized columns first, then drop raw extras.
+    final_cols = [
+        "datetime_hb", "datetime_he", "market_type", "name", "asset",
+        "ops_type", "service", "da_volume", "price", "max_daily_award_limit",
+    ]
+    for col in final_cols:
+        if col not in melted.columns:
+            melted[col] = pd.NA
+    melted = melted[final_cols]
+
+    return melted

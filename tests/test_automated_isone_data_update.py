@@ -49,6 +49,16 @@ class TestAutomatedIsoneDataUpdateValidation:
                 market="invalid_market",
             )
 
+    def test_offers_ancillary_table_invalid_market_raises(self):
+        _skip_if_no_module()
+        with pytest.raises(ValueError, match="market must be one of"):
+            automated_isone_data_update(
+                "user", "token",
+                table_name="offers.flp_isone_ancillary",
+                tz="America/New_York",
+                market="invalid_market",
+            )
+
     def test_offers_table_invalid_offers_ops_type_mode_raises(self):
         _skip_if_no_module()
         with pytest.raises(ValueError, match="offers_ops_type_mode must be one of"):

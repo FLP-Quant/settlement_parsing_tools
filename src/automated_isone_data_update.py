@@ -13,7 +13,12 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from src.process_as_positions import process_daas_cleared_data, process_rt_reserve_data
-from src.pharos_ams_query import query_ams_with_basic_auth, query_schedule_offers_historic, process_schedule_offers_historic
+from src.pharos_ams_query import (
+    query_ams_with_basic_auth,
+    query_schedule_offers_historic,
+    process_schedule_offers_historic,
+    process_ancillary_schedule_offers_historic,
+)
 from src.parsers import RealTimeOps, prep_rtlocsum_for_quant_db, retrieve_isone_location_map
 
 # FLP database connection tools path
@@ -50,13 +55,14 @@ def automated_isone_data_update(
 ):
     """
     mis_report : used for ops.isone_hourly_ancillary (e.g. 'SD_DAASCLEARED', 'OI_UNITRTRSV').
-    market : used for offers.flp_isone_energy: 'DA' (day-ahead) or 'RT' (real-time). Default 'DA'.
+    market : used for offers tables: 'DA' (day-ahead) or 'RT' (real-time). Default 'DA'.
     """
-    supported_tables = ['ops.isone_hourly_ancillary', 'ops.isone_hourly_energy', 'offers.flp_isone_energy']
+    offers_tables = ['offers.flp_isone_energy', 'offers.flp_isone_ancillary']
+    supported_tables = ['ops.isone_hourly_ancillary', 'ops.isone_hourly_energy'] + offers_tables
     if table_name not in supported_tables:
         raise ValueError(f"Table name '{table_name}' not yet supported. supported values are: {supported_tables}")
 
-    if table_name == 'offers.flp_isone_energy':
+    if table_name in offers_tables:
         if market is None:
             market = 'DA'
         if market not in ('DA', 'RT'):
@@ -84,7 +90,7 @@ def automated_isone_data_update(
             start_date = datetime(2025,3,1).date()
         elif table_name == 'ops.isone_hourly_energy':
             start_date = datetime(2016,5,11).date()
-        elif table_name == 'offers.flp_isone_energy':
+        elif table_name in offers_tables:
             start_date = datetime(2025, 1, 1).date()
         print(f"Using default start_date: {start_date}")
     else:
@@ -110,7 +116,7 @@ def automated_isone_data_update(
     table_exists = db_conn.table_exists(table_name, server="DataQuant01")
     if not table_exists:
         print(f"Table {table_name} does not exist in database. Treating as empty table.")
-        existing_data = pd.DataFrame(columns=composite_cols + (['da_volume', 'rt_volume'] if table_name != 'offers.flp_isone_energy' else []))
+        existing_data = pd.DataFrame(columns=composite_cols + (['da_volume', 'rt_volume'] if table_name not in offers_tables else []))
     else:
         # Query with date filter to only get data >= start_date
         sql_query = f"""
@@ -165,16 +171,20 @@ def automated_isone_data_update(
                 for asset in asset_names
             ]
         )
-    elif table_name == 'offers.flp_isone_energy':
-        # One placeholder row so expected grid = one row per hour; API returns all units (ops_type/service fixed in process)
+    elif table_name in offers_tables:
+        # Placeholder rows so expected grid = one row per hour per expected offers service/ops_type.
         if offers_ops_type_mode == "both":
             ops_types = ["Generation", "Pumping"]
         else:
             ops_types = [offers_ops_type_mode]
+        if table_name == 'offers.flp_isone_energy':
+            services = ["energy"]
+        else:
+            services = ["TMNSR", "TMSR", "TMOR", "EIR"]
         unique_combos = pd.DataFrame(
             [
-                {"name": "*", "market_type": market, "ops_type": ot, "service": "energy"}
-                for ot in ops_types
+                {"name": "*", "market_type": market, "ops_type": ot, "service": svc}
+                for ot, svc in product(ops_types, services)
             ]
         )
 
@@ -200,7 +210,7 @@ def automated_isone_data_update(
         value_column=volume_col,
         treat_value_as_missing=None,  # default: NaN/empty = missing, 0 = not missing
         table_exists=table_exists,
-        skip_high_missing_pct_check=(mis_report == 'OI_UNITRTRSV' or table_name == 'offers.flp_isone_energy'),
+        skip_high_missing_pct_check=(mis_report == 'OI_UNITRTRSV' or table_name in offers_tables),
     )
 
     # Debug: optionally print spring-forward date missing vs existing vs expected
@@ -224,9 +234,9 @@ def automated_isone_data_update(
             date_groups = chunk_date_groups(date_groups, max_days=30)
             print(f"Segmented into {len(date_groups)} monthly chunks (max 30 days each) for OI_UNITRTRSV")
         # Schedule offers API: use smaller chunks to avoid timeouts
-        elif table_name == 'offers.flp_isone_energy':
+        elif table_name in offers_tables:
             date_groups = chunk_date_groups(date_groups, max_days=30)
-            print(f"Segmented into {len(date_groups)} monthly chunks (max 30 days each) for schedule offers API")
+            print(f"Segmented into {len(date_groups)} monthly chunks (max 30 days each) for offers API")
 
         print(f"Grouped into {len(date_groups)} contiguous date ranges")
         
@@ -238,7 +248,7 @@ def automated_isone_data_update(
             group_end = (date_group[-1] + timedelta(days=1)).strftime('%Y-%m-%d')  # MIS API expects exclusive end
             print(f"Querying API {i+1}/{len(date_groups)}: {group_start} to {group_end}")
             try:
-                if table_name == 'offers.flp_isone_energy':
+                if table_name in offers_tables:
                     group_end_inclusive = date_group[-1].strftime('%Y-%m-%d')
                     ops_types_to_run = (
                         ["Generation", "Pumping"]
@@ -247,6 +257,7 @@ def automated_isone_data_update(
                     )
                     # API expects day_ahead/real_time/reoffer; we use DA/RT/reoffer in app
                     api_market = {"DA": "day_ahead", "RT": "real_time"}.get(market, market)
+                    offer_product = "energy" if table_name == "offers.flp_isone_energy" else "ancillary"
                     offer_parts = []
                     for ot in ops_types_to_run:
                         df_part = query_schedule_offers_historic(
@@ -256,6 +267,7 @@ def automated_isone_data_update(
                             market=api_market,
                             end_date=group_end_inclusive,
                             ops_type=ot,
+                            offer_product=offer_product,
                             timeout=120,
                         )
                         if len(df_part) > 0:
@@ -269,6 +281,14 @@ def automated_isone_data_update(
                     url = f"https://ams.pharos-ei.com/api/v2/isone/mis/downloads.csv?organization_key=ho-fl&settle_since={group_start}&settle_before={group_end}&most_recent_version={most_recent_version}&report_name={mis_report}"
                     df_raw = query_ams_with_basic_auth(url, token)
                 if len(df_raw) > 0:
+                    if table_name == 'offers.flp_isone_ancillary':
+                        preview_cols = list(df_raw.columns)
+                        print(f"  Ancillary raw columns sample: {preview_cols[:12]}")
+                        if "schedule_offer_hourly" in df_raw.columns:
+                            print(
+                                f"  Retrieved {len(df_raw)} container rows "
+                                "(nested schedule_offer_hourly payloads; expands during processing)"
+                            )
                     all_raw_data.append(df_raw)
                     print(f"  Retrieved {len(df_raw)} rows")
                 else:
@@ -304,6 +324,9 @@ def automated_isone_data_update(
                 df_raw = pd.concat(all_raw_data, ignore_index=True)
                 df_final = process_schedule_offers_historic(df_raw, mapping_path, tz=tz)
                 df_final['datetime_he'] = df_final['datetime_hb'] + pd.Timedelta(hours=1)
+            elif table_name == 'offers.flp_isone_ancillary':
+                df_raw = pd.concat(all_raw_data, ignore_index=True)
+                df_final = process_ancillary_schedule_offers_historic(df_raw, mapping_path, tz=tz)
             else:
                 raise ValueError("This should have caused an error already on the first line of the program that checks table names.")
                 
@@ -408,7 +431,7 @@ def automated_isone_data_update(
                 #     print(f"  Columns only in new data: {only_in_new}")
                 #     print(f"  Columns only in existing table: {only_in_existing}")
 
-                if fill_with_zeros and table_name != 'offers.flp_isone_energy':
+                if fill_with_zeros and table_name not in offers_tables:
                     mapping = retrieve_isone_location_map(mapping_path)
                     mapping_df = mapping[["ISO-NE Name", "FLP Asset Name"]].rename(
                         columns={"ISO-NE Name": "name", "FLP Asset Name": "asset"}
@@ -468,19 +491,27 @@ def automated_isone_data_update(
                 # Final deduplication check before upload to prevent MERGE errors
                 print("\nPerforming final deduplication check before upload...")
                 initial_upload_count = len(df_final)
+                dup_mask_before = df_final.duplicated(subset=composite_cols, keep=False)
+                duplicate_sample = (
+                    df_final.loc[dup_mask_before]
+                    .sort_values(by=composite_cols)
+                    .head(20)
+                    .copy()
+                    if dup_mask_before.any()
+                    else pd.DataFrame()
+                )
                 df_final = df_final.drop_duplicates(subset=composite_cols, keep='first')
                 if len(df_final) < initial_upload_count:
                     removed = initial_upload_count - len(df_final)
                     # Debug: Show which records were duplicates
                     print(f"DEBUG: Found {removed} duplicate records before upload.")
                     print(f"DEBUG: Original count: {initial_upload_count}, Final count: {len(df_final)}")
-                    print(f"DEBUG: Checking for duplicate groups...")
-                    dup_mask_before = df_final.duplicated(subset=composite_cols, keep=False)
-                    if dup_mask_before.any():
-                        print(f"DEBUG: Still found {dup_mask_before.sum()} duplicate rows after drop_duplicates!")
-                        print(f"DEBUG: Sample duplicates:\n{df_final[dup_mask_before][composite_cols].head(10)}")
-                    else:
-                        print(f"DEBUG: No remaining duplicates found in df_final after drop_duplicates")
+                    if len(duplicate_sample) > 0:
+                        sample_cols = [
+                            c for c in composite_cols + ['schedule_id', 'da_volume', 'rt_volume', 'price']
+                            if c in duplicate_sample.columns
+                        ]
+                        print(f"DEBUG: Sample duplicate rows before drop_duplicates:\n{duplicate_sample[sample_cols].to_string()}")
                     
                     # Raise error instead of warning - duplicates indicate a problem in processing
                     raise ValueError(
@@ -508,6 +539,48 @@ def automated_isone_data_update(
                     df_final['rt_volume'] = pd.to_numeric(df_final['rt_volume'], errors='coerce')
                     # Ensure the dtype is numeric (float64 to handle NaN values)
                     df_final['rt_volume'] = df_final['rt_volume'].astype('float64')
+                if 'max_daily_award_limit' in df_final.columns:
+                    df_final['max_daily_award_limit'] = df_final['max_daily_award_limit'].replace(
+                        ['', None], pd.NA
+                    )
+                    df_final['max_daily_award_limit'] = pd.to_numeric(
+                        df_final['max_daily_award_limit'], errors='coerce'
+                    )
+                    df_final['max_daily_award_limit'] = df_final['max_daily_award_limit'].astype(
+                        'float64'
+                    )
+
+                # Defensive schema alignment for offers append:
+                # API can add new columns over time; keep upload columns in sync with SQL table.
+                if table_name in offers_tables and table_exists:
+                    sql_columns = existing_data.columns.tolist()
+                    extra_upload_cols = [c for c in df_final.columns if c not in sql_columns]
+                    missing_upload_cols = [c for c in sql_columns if c not in df_final.columns]
+                    if extra_upload_cols:
+                        # Allow new analytical columns through until the SQL table is migrated.
+                        allowed_extra = {"max_daily_award_limit"}
+                        extra_upload_cols = [c for c in extra_upload_cols if c not in allowed_extra]
+                    if extra_upload_cols:
+                        print(
+                            "Dropping unexpected columns for offers upload: "
+                            f"{extra_upload_cols}"
+                        )
+                        df_final = df_final.drop(columns=extra_upload_cols, errors='ignore')
+                    if missing_upload_cols:
+                        columns_added_postprocess = {
+                            'update_timestamp', 'update_user', 'date', 'he', 'datetime_he'
+                        }
+                        missing_auto_added = [c for c in missing_upload_cols if c in columns_added_postprocess]
+                        missing_other = [c for c in missing_upload_cols if c not in columns_added_postprocess]
+                        print(
+                            "Offers upload payload is missing columns. "
+                            "Proceeding without raising here and deferring handling to "
+                            f"flp_database_helpers post-processing. Missing columns: {missing_upload_cols}"
+                        )
+                        if missing_auto_added:
+                            print(f"  Expected post-processed columns: {missing_auto_added}")
+                        if missing_other:
+                            print(f"  Other missing columns (post-processing will handle): {missing_other}")
 
                 # Upload to database (create table if it doesn't exist, else update/append)
                 print("Uploading to database...")
